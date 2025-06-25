@@ -4,6 +4,8 @@ import ray
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
+from pathlib import Path
+import logging
 
 def interpolator_arr(arr):
 	x = np.arange(len(arr))
@@ -57,28 +59,32 @@ def get_data(data_name, data_class, freq, col_type):
 		sample data: 90 days 20160101-20160401
 		frequency, column type @INNOAM
 	"""
-	all_data_path = '/dat5/all/AlphaDigData/EquityAhare_complete 20231229'
+	logger = logging.getLogger(__name__)
+	all_data_path = Path('/dat5/all/AlphaDigData/EquityAhare_complete 20231229')
 	data_path_dic = {}
 	if freq == 'daily':
 		data_path_dic = {
-			"moneyflow": f'{all_data_path}/Moneyflow',
-			"DailyBase": f'{all_data_path}/DailyBase'
+			"moneyflow": all_data_path / 'Moneyflow',
+			"DailyBase": all_data_path / 'DailyBase'
 		}
 	elif freq in ['5', '15', '30', '60']:
 		data_path_dic = {
-			"tick": f'{all_data_path}/{freq}MinuteBase',
-			"moneyflow": f'{all_data_path}/moneyflow_{freq}min'
+			"tick": all_data_path / f'{freq}MinuteBase',
+			"moneyflow": all_data_path / f'moneyflow_{freq}min'
 		}
 	else:
+		logger.error(f"Invalid frequency: {freq}")
 		raise KeyError
 	data_path = data_path_dic[data_class]
+	logger.info(f"Loading data from {data_path / f'{data_name}.hdf5'}")
 	res_dic = {}
-	dat = pd.read_hdf(f'{data_path}/{data_name}.hdf5')
-	data = dat.loc['2018-01':'2018-04'].dropna(how='all', axis=1).copy()
+	dat = pd.read_hdf(str(data_path / f'{data_name}.hdf5'))
+	data = dat.loc['2018-01':'2018-04'].dropna(how='all', axis=1).copy() # More concise
 	del dat
 	data.columns = [int(i[:6]) for i in data.columns]
 	res_dic['data'] = data
-	res_dic['data_file'] = os.path.basename(data_path)
+	res_dic['data_file'] = data_path.name
+	logger.info(f"Loaded data shape: {data.shape}")
 	return res_dic
 
 def extract_value_from_string(input_string):

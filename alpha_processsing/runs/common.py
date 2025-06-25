@@ -10,7 +10,7 @@ import subprocess
 from tqdm import tqdm
 from typing import Dict, List
 import ast
-from ..utils import data_utils as utils
+from .. import utils
 from . import path_set
 from ..calculators.level1_calculator import Level1Calculator
 from ..processors.level1_processor import ProcessCalculatorL1
