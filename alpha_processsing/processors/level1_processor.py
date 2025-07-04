@@ -1,14 +1,18 @@
 import numpy as np
 import torch
+
 from functools import wraps
 from joblib import Parallel, delayed
-from .np_cal_func import fill_inf_with_max_min
+from .np_cal_func import fill_inf_with_max_min_ts_decorator
 from .filter_func import (
     dwt_ca_fixed, dwt_da_fixed, dwt_ca, dwt_da, savgol_filter, median_filter,
-    lowpass_filter, highpass_filter, butter_highpass_filter, bandpass_filter,
-    wavelet_denoise, ewma_filter, kalman_filter, hp_filter, robust_zscore_filter,
-    rolling_rank_filter, adaptive_moving_average, interpolator_arr
+    lowpass_filter, highpass_filter, bandpass_filter,wavelet_denoise, 
+    ewma_filter, kalman_filter, hp_filter, robust_zscore_filter, interpolator_arr,
+    rolling_rank_filter, kaufman_adaptive_moving_average, mesa_adaptive_moving_average,
+    hilbert_transform_instantaneous_phase
 )
+
+
 
 class ProcessCalculator:
     def cal_functions(self, result: np.ndarray, func_str: tuple, backend="torch", device="cpu") -> np.ndarray:
@@ -56,31 +60,7 @@ class ProcessCalculatorL1(ProcessCalculator):
         self.shrink_factor = config.get("processor_params", {}).get("level1", {}).get("shrink_factor", 1.0)
         torch.set_num_threads(8)
 
-    def fill_inf_with_max_min_ts_decorator(process_input=True, process_output=True):
-        def decorator(func):
-            @wraps(func)
-            @torch.no_grad()
-            def wrapper(self, *args, **kwargs):
-                backend = kwargs.get("backend", self.backend)
-                device = kwargs.get("device", self.device)
-                axis = self.config.get("processor_params", {}).get("level1", {}).get("inf_handling", {}).get("axis", 0)
-                arr = args[0]
-                if process_input and isinstance(arr, (np.ndarray, torch.Tensor)):
-                    if backend == "torch" and isinstance(arr, np.ndarray):
-                        arr = torch.from_numpy(arr).float().to(device)
-                    arr = fill_inf_with_max_min(arr, axis=axis, backend=backend, device=device)
-                    if backend == "torch" and isinstance(args[0], np.ndarray):
-                        arr = arr.cpu().numpy()
-                result = func(self, arr, *args[1:], **kwargs)
-                if process_output and isinstance(result, (np.ndarray, torch.Tensor)):
-                    if backend == "torch" and isinstance(result, np.ndarray):
-                        result = torch.from_numpy(result).float().to(device)
-                    result = fill_inf_with_max_min(result, axis=axis, backend=backend, device=device)
-                    if backend == "torch" and isinstance(args[0], np.ndarray):
-                        result = result.cpu().numpy()
-                return result
-            return wrapper
-        return decorator
+    
 
     def _safe_normalize(self, array: np.ndarray, backend: str = "numpy", device: str = "cpu") -> np.ndarray:
         max_abs = np.log(np.finfo(np.float64).max) / 2
@@ -188,6 +168,44 @@ class ProcessCalculatorL1(ProcessCalculator):
         return self.specialized_output_shape(array, result)
 
     @fill_inf_with_max_min_ts_decorator()
+    def apo(self, array: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
+        if backend == "torch":
+            array = torch.from_numpy(array).float().to(device)
+            result = torch.abs(array - torch.mean(array, dim=0, keepdim=True)).cpu().numpy()
+        else:
+            result = np.abs(array - np.nanmean(array, axis=0, keepdims=True))
+        return result
+    
+
+    @fill_inf_with_max_min_ts_decorator()
+    def aroonosc(self, array: np.ndarray, period: int = 4, backend="numpy", device="cpu") -> np.ndarray:
+        """
+        Calculate Aroon Oscillator for a given period
+        calculation formula: 
+        ((Aroon Up - Aroon Down) / (Aroon Up + Aroon Down)) * 100
+        Aroon Up = (period - index of last highest high) / period * 100
+        Aroon Down = (period - index of last lowest low) / period * 100
+        Args:
+            array (np.ndarray): Input array with shape (n_samples, n_features)
+            period (int): Period for Aroon calculation
+            backend (str): Backend to use ('numpy' or 'torch')
+            device (str): Device to use for torch backend ('cpu' or 'cuda') 
+        """
+        if backend == "torch":
+            array = torch.from_numpy(array).float().to(device)
+            high = torch.max(array[-period:], dim=0).values
+            low = torch.min(array[-period:], dim=0).values
+            result = ((high - low) / (high + low)) * 100
+            return result.cpu().numpy()
+        else:
+            high = np.max(array[-period:], axis=0)
+            low = np.min(array[-period:], axis=0)
+            result = ((high - low) / (high + low)) * 100
+        return result
+    
+    
+
+    @fill_inf_with_max_min_ts_decorator()
     def rolling_mean(self, array: np.ndarray, window: int, backend="numpy", device="cpu") -> np.ndarray:
         if backend == "torch":
             array = torch.from_numpy(array).float().to(device)
@@ -220,7 +238,16 @@ class ProcessCalculatorL1(ProcessCalculator):
             pad = (array.shape[0] - result.shape[0]) // 2
             result = np.pad(result, ((pad, array.shape[0] - result.shape[0] - pad), (0, 0)), mode='edge')
         return result
-
+    #Todo: implement entropy
+    @fill_inf_with_max_min_ts_decorator()
+    def entropy(self, array: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
+        if backend == "torch":
+            array = torch.from_numpy(array).float().to(device)
+            result = -torch.sum(array * torch.log(array + 1e-10), dim=0).cpu().numpy()
+        else:
+            result = -np.nansum(array * np.log(array + 1e-10), axis=0)
+        return result
+    
     @fill_inf_with_max_min_ts_decorator()
     def rolling_min(self, array: np.ndarray, window: int, backend="numpy", device="cpu") -> np.ndarray:
         if backend == "torch":
@@ -313,7 +340,8 @@ class ProcessCalculatorL1(ProcessCalculator):
             pad = (array.shape[0] - result.shape[0]) // 2
             result = np.pad(result, ((pad, array.shape[0] - result.shape[0] - pad), (0, 0)), mode='edge')
         return result
-
+   
+    
     @fill_inf_with_max_min_ts_decorator()
     def pct_rank(self, array: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
         if backend == "torch":
@@ -348,7 +376,6 @@ class ProcessCalculatorL1(ProcessCalculator):
             "median_filter": median_filter,
             "lowpass_filter": lowpass_filter,
             "highpass_filter": highpass_filter,
-            "butter_highpass_filter": butter_highpass_filter,
             "bandpass_filter": bandpass_filter,
             "wavelet_denoise": wavelet_denoise,
             "ewma_filter": ewma_filter,
@@ -356,7 +383,9 @@ class ProcessCalculatorL1(ProcessCalculator):
             "hp_filter": hp_filter,
             "robust_zscore_filter": robust_zscore_filter,
             "rolling_rank_filter": rolling_rank_filter,
-            "adaptive_moving_average": adaptive_moving_average
+            "kaufman_adaptive_moving_average": kaufman_adaptive_moving_average,
+            "mesa_adaptive_moving_average": mesa_adaptive_moving_average,
+            "hilbert_transform_instantaneous_phase": hilbert_transform_instantaneous_phase, 
         }.get(filter_name)
         if not callable(filter_func):
             raise ValueError(f"Filter {filter_name} not found")
@@ -374,9 +403,66 @@ class ProcessCalculatorL1(ProcessCalculator):
             result = result_valid
 
         return self.specialized_output_shape(array, result)
+    
+    def dwt_ca(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "dwt_ca", backend=backend, device=device, **kwargs) 
+    
+    def dwt_da(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "dwt_da", backend=backend, device=device, **kwargs)
 
+    def dwt_ca_fver(self, array: np.ndarray, backend="torch", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "dwt_ca_fixed", backend=backend, device=device, **kwargs)
+
+    def dwt_da_fver(self, array: np.ndarray, backend="torch", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "dwt_da_fixed", backend=backend, device=device, **kwargs)
+
+    def savgolfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "savgol_filter", backend=backend, device=device, **kwargs)  
+    
+    def medfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "median_filter", backend=backend, device=device, **kwargs)  
+    
+    def lowpfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "lowpass_filter", backend=backend, device=device, **kwargs) 
+    
+    def highpfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "highpass_filter", backend=backend, device=device, **kwargs)    
+    
+    def bandpfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "bandpass_filter", backend=backend, device=device, **kwargs)
+    
+    def wdfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "wavelet_denoise", backend=backend, device=device, **kwargs)
+    
+    def ewma(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "ewma_filter", backend=backend, device=device, **kwargs)    
+    
+    def kalfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "kalman_filter", backend=backend, device=device, **kwargs)
+    
+    def hpfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "hp_filter", backend=backend, device=device, **kwargs)  
+    
+    def rob_zsfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "robust_zscore_filter", backend=backend, device=device, **kwargs)
+    
+    def rollrankfilt(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "rolling_rank_filter", backend=backend, device=device, **kwargs)
+
+    def kauama(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "kaufman_adaptive_moving_average", backend=backend, device=device, **kwargs)
+    
+    def mesama(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "mesa_adaptive_moving_average", backend=backend, device=device, **kwargs)
+    
+    def hb_insphase(self, array: np.ndarray, backend="numpy", device="cpu", **kwargs) -> np.ndarray:
+        return self.apply_filter(array, "hilbert_transform_instantaneous_phase", backend=backend, device=device, **kwargs)
+    
     @fill_inf_with_max_min_ts_decorator(process_input=True, process_output=False)
-    def weighted_mean(self, array: np.ndarray, weights: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
+    def meanwgt(self, array: np.ndarray, weights: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
+        """
+        Calculate weighted mean across time axis
+        """
         if backend == "torch":
             array = torch.from_numpy(array).float().to(device)
             weights = torch.from_numpy(weights).float().to(device)
@@ -387,8 +473,24 @@ class ProcessCalculatorL1(ProcessCalculator):
             result = np.nansum(array * weights, axis=0, keepdims=True)
         return result.T
 
+    @fill_inf_with_max_min_ts_decorator(process_input=True, process_output=False)
+    def revwtg(self, array: np.ndarray, weights: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
+        """
+        Calculate reverse weighted mean across time axis
+        """
+        if backend == "torch":
+            array = torch.from_numpy(array).float().to(device)
+            weights = torch.from_numpy(weights).float().to(device)
+            weights = weights / torch.nansum(weights, dim=0, keepdim=True)
+            result = torch.nansum(array * (1 - weights), dim=0, keepdim=True).cpu().numpy()
+        else:
+            weights = weights / np.nansum(weights, axis=0, keepdims=True)
+            result = np.nansum(array * (1 - weights), axis=0, keepdims=True)
+        return result.T
+    
+    
     @fill_inf_with_max_min_ts_decorator(process_input=False, process_output=True)
-    def exponential_weight(self, array: np.ndarray, span: int, backend="numpy", device="cpu") -> np.ndarray:
+    def expwgt(self, array: np.ndarray, span: int, backend="numpy", device="cpu") -> np.ndarray:
         n = array.shape[0]
         alpha = 2 / (span + 1)
         weights = np.exp(-alpha * np.arange(n)[::-1])

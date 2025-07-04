@@ -3,9 +3,9 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from itertools import permutations
-from ..utils.data_utils import fill_data
+from utils.fill_utils import fill_data_by_group
 
-@ray.remote
+
 class BaseCalculator:
     def __init__(self, data, cal_func_class, fill_method=None, window=None):
         self.data = data
@@ -19,7 +19,7 @@ class BaseCalculator:
             self.data.index = pd.to_datetime(self.data.index)
             self.data = self.data.sort_index()
             self.grouped_data = [
-                fill_data(group.sort_index().values, self.fill_method)
+                fill_data_by_group(group.sort_index().values, self.fill_method)
                 for _, group in self.data.groupby(self.data.index.date)
             ]
         elif isinstance(self.data, dict):

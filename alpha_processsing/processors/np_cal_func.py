@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from functools import wraps
 from scipy.interpolate import interp1d
 
 def fill_inf_with_max_min(arr: np.ndarray, axis: int = 0, backend: str = "numpy", device: str = "cpu") -> np.ndarray:
@@ -27,6 +28,66 @@ def fill_inf_with_max_min(arr: np.ndarray, axis: int = 0, backend: str = "numpy"
                 arr[mask_inf_pos] = max_val
                 arr[mask_inf_neg] = min_val
         return arr
+
+def fill_inf_with_max_min_section_decorator(process_input=True, process_output=True):
+    """Decorator to handle inf values along time and section axes"""
+    def decorator(func):
+        @wraps(func)
+        @torch.no_grad()
+        def wrapper(self, *args, **kwargs):
+            backend = kwargs.get("backend", self.backend)
+            device = kwargs.get("device", self.device)
+            axis = self.config.get("processor_params", {}).get("level2", {}).get("inf_handling", {}).get("axis", 1)
+
+            # Handle input
+            x = args[0]
+            if process_input and isinstance(x, (np.ndarray, torch.Tensor)):
+                if backend == "torch" and isinstance(x, np.ndarray):
+                    x = torch.from_numpy(x).float().to(device)
+                x = fill_inf_with_max_min(x, axis=axis, backend=backend, device=device)
+                if backend == "torch" and isinstance(args[0], np.ndarray):
+                    x = x.cpu().numpy()
+
+            # Execute function
+            result = func(self, x, *args[1:], backend=backend, device=device, **kwargs)
+
+            # Handle output
+            if process_output and isinstance(result, (np.ndarray, torch.Tensor)):
+                if backend == "torch" and isinstance(result, np.ndarray):
+                    result = torch.from_numpy(result).float().to(device)
+                result = fill_inf_with_max_min(result, axis=axis, backend=backend, device=device)
+                if backend == "torch" and isinstance(args[0], np.ndarray):
+                    result = result.cpu().numpy()
+
+            return result
+        return wrapper
+    return decorator
+
+def fill_inf_with_max_min_ts_decorator(process_input=True, process_output=True):
+        def decorator(func):
+            @wraps(func)
+            @torch.no_grad()
+            def wrapper(self, *args, **kwargs):
+                backend = kwargs.get("backend", self.backend)
+                device = kwargs.get("device", self.device)
+                axis = self.config.get("processor_params", {}).get("level1", {}).get("inf_handling", {}).get("axis", 0)
+                arr = args[0]
+                if process_input and isinstance(arr, (np.ndarray, torch.Tensor)):
+                    if backend == "torch" and isinstance(arr, np.ndarray):
+                        arr = torch.from_numpy(arr).float().to(device)
+                    arr = fill_inf_with_max_min(arr, axis=axis, backend=backend, device=device)
+                    if backend == "torch" and isinstance(args[0], np.ndarray):
+                        arr = arr.cpu().numpy()
+                result = func(self, arr, *args[1:], **kwargs)
+                if process_output and isinstance(result, (np.ndarray, torch.Tensor)):
+                    if backend == "torch" and isinstance(result, np.ndarray):
+                        result = torch.from_numpy(result).float().to(device)
+                    result = fill_inf_with_max_min(result, axis=axis, backend=backend, device=device)
+                    if backend == "torch" and isinstance(args[0], np.ndarray):
+                        result = result.cpu().numpy()
+                return result
+            return wrapper
+        return decorator
 
 def cal_skew(window):
     window_no_nan = window[~np.isnan(window)]

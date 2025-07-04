@@ -1,0 +1,11 @@
+factor_name: "buy_volume_exlarge_order"
+output_dir: "output"
+data_config:
+  buy_volume_exlarge_order:
+    type: "moneyflow"
+    freq: "15"
+params:
+  lookback_period: 100
+  delay_period: 10
+  
+  

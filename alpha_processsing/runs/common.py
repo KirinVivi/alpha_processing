@@ -1,5 +1,7 @@
 import os
 import gc
+
+from matplotlib import table
 import ray
 import yaml
 import pandas as pd
@@ -10,7 +12,7 @@ import subprocess
 from tqdm import tqdm
 from typing import Dict, List
 import ast
-from .. import utils
+from utils import data_utils as utils
 from . import path_set
 from ..calculators.level1_calculator import Level1Calculator
 from ..processors.level1_processor import ProcessCalculatorL1
@@ -32,8 +34,14 @@ def init_ray(config: dict):
     except Exception as e:
         raise RuntimeError(f"Ray initialization failed: {e}")
 
-def load_data(table_name: str, table_type: str, table_freq: str, config: dict) -> pd.DataFrame:
+def load_data(config: dict) -> pd.DataFrame:
     """Load or generate data."""
+    table_name = config.get('table_name')
+    table_type = config.get('table_type')
+    table_freq = config.get('table_freq', '15') # Default to 15 minutes if not specified
+
+    if not table_name or not table_type or not table_freq:
+        raise ValueError("Table name, type, and frequency must be specified in the config.")
     cal_data_prefix = f'{table_name}_{table_type[0]}_{table_freq}'
     cal_data_path = Path(path_set.original_alpha_data_path) / f'{cal_data_prefix}.hdf5'
 
@@ -43,7 +51,13 @@ def load_data(table_name: str, table_type: str, table_freq: str, config: dict) -
         if not script_path.exists():
             raise FileNotFoundError(f"Data generation script not found: {script_path}")
         try:
-            subprocess.run(["python", str(script_path)], check=True)
+            # Use -m to run as a module if the script is part of a package
+            subprocess.run(
+                ["python", "-m", f"{script_path.parent.name}.{script_path.stem}"],
+                cwd="C:/Users/admin/Desktop/zww/ssh_alpha", # Adjust this path as needed
+                check=True
+            )
+            # todo : 
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to generate data: {e}")  
     try:

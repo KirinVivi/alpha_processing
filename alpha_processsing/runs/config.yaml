@@ -1,0 +1,195 @@
+# demo
+global_settings:
+  # logging 配置
+  logging:
+    log_dir: /path/to/logs  # 日志目录
+    level: info  # 日志级别，可选值：debug, info, warning, error, critical
+    console_level: info  # 控制台日志级别
+    file_level: DEBUG  # 文件日志级别
+
+  # Ray 配置
+  ray:
+    num_cpus: 8 
+    temp_dir: /tmp/ray  # Ray 临时目录
+
+  # paths
+  paths:
+    original_alpha_data_path: /path/to/original/data  # 原始数据路径
+    code_recorded_path: /path/to/code/recorded  # 代码模板路径
+    backtest_path: /path/to/backtest  # 回测代码生成路径
+    demo_path: /path/to/demo  # 配置模板路径
+    backtest_path: /path/to/backtest  # 回测代码生成路径
+    data_dir: /path/to/data  # 数据目录
+    config_dir: /path/to/config  # 配置目录
+
+  # ic params:
+  ic_params:
+    ret_path: /path/to/returns  # 收益率数据路径
+    window: 20  # 窗口大小
+    min_ic: 0.015  # 最小信息系数
+    min_rank_ic: 0.015  # 最小排名信息系数
+
+  # other settings
+  default_batch_size: 20  # 批处理大小，用于 load_nested_dict 和 compute_ic
+
+# 处理器参数
+processor_params:
+  level1:
+    shrink_factor: 1.0  # 用于标准化数据，防止数值溢出
+    inf_handling:
+      axis: 0  # 处理无穷大值的轴（0 为时间轴，1 为横截面轴）
+    filters:  # 过滤器参数配置
+      dwt_ca_fixed:
+        wavelet: db1  # 离散小波变换使用的 wavelet 类型
+      dwt_da_fixed:
+        wavelet: db1
+      dwt_ca:
+        wavelet: db1
+        level: 1
+      dwt_da:
+        wavelet: db1
+        level: 1
+      savgol_filter:
+        window_length: 5
+        polyorder: 2
+      median_filter:
+        size: 5
+      lowpass_filter:
+        cutoff: 0.1
+        fs: 10.0
+        order: 5
+      highpass_filter:
+        cutoff: 0.1
+        fs: 10.0
+        order: 5
+      butter_highpass_filter:
+        cutoff: 0.1
+        fs: 10.0
+        order: 5
+      bandpass_filter:
+        lowcut: 0.1
+        highcut: 0.5
+        fs: 10.0
+        order: 5
+      wavelet_denoise:
+        wavelet: db4
+        level: 1
+        mode: soft
+      ewma_filter:
+        span: 10
+      kalman_filter:
+        transition_covariance: 0.01
+        observation_covariance: 0.1
+      hp_filter:
+        lamb: 1600
+      robust_zscore_filter:
+        threshold: 3.0
+      rolling_rank_filter:
+        window: 5
+      adaptive_moving_average:
+        window: 10
+        sensitivity: 2.0
+
+  level2:
+    inf_handling:
+      axis: 1  # 处理无穷大值的轴（0 为时间轴，1 为横截面轴）
+
+# 过滤参数
+filter_params:
+  level1:
+    windows: [2, 5, 7]  # 窗口大小列表，用于 group_data_by_window 和 process_level1
+    fill_methods: [null, fill_cross_sectional_mean, ffill]  # 数据填充方法
+  level2:
+    smoothing_methods: [quantile_25, mean, quantile_75, skew, kurt, cv, ptp, sum, stddev]  # 平滑方法列表
+
+experiments:
+  - name: "experiment_1"
+    description: "First experiment with basic settings"
+    active: true
+
+    data_params:
+      table_name: "moneyflow_data"
+      table_type: "moneyflow"
+      table_freq: "15"
+    func_params:
+      level1:
+        rolling_para: [2, 5, 7]  # 窗口大小列表
+        func_list:
+          - diff
+          - apo
+          - abs_v
+          - sigmoid
+          - tan
+          - sin
+          - cos
+          - sinh
+          - cosh
+          - tanh  
+          - reciprocal
+          - pct_rank
+          - dwt_ca
+          - dwt_da
+          - dwt_ca_fver
+          - dwt_da_fver
+          - savgolfilt
+          - medfilt
+          - lowpfilt
+          - highpfilt
+          - bandpfilt
+          - wdfilt
+          - hpfilt
+          - rob_zsfilt
+          - rollrankfilt
+          - ewma
+          - kalfilt
+          - hb_insphase
+          - kauama
+          - mesama
+          - meanwgt
+          - expwgt
+          - revwgt
+
+          - aroonosc
+          - rolling_mean
+          - rolling_max
+          - rolling_min
+          - rolling_zscore
+          - rolling_std
+          - rolling_skew
+          - rolling_kurt
+      level2:
+        func_list:
+          - quantile_25
+          - mean
+          - quantile_75
+          - skew
+          - kurt
+          - cv
+          - ptp
+          - sum
+          - stddev
+          - bop
+
+      
+
+  - name: "experiment_2"
+    description: "Second experiment with modified parameters"
+    active: true
+    data_params:
+      table_name: "moneyflow_data"
+      table_type: "moneyflow"
+      table_freq: "30"
+    func_params:
+      func_name: "process_moneyflow_data"
+      func_type: "moneyflow"
+
+  - name: "experiment_3"
+    description: "Third experiment with further modifications"
+    active: true
+    data_params:
+      table_name: "moneyflow_data"
+      table_type: "moneyflow"
+      table_freq: "60"
+    func_params:
+      func_name: "process_moneyflow_data"
+      func_type: "moneyflow"

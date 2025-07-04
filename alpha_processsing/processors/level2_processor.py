@@ -1,8 +1,7 @@
 import numpy as np
 import torch
-from functools import wraps
 from joblib import Parallel, delayed
-from .np_cal_func import fill_inf_with_max_min
+from .np_cal_func import fill_inf_with_max_min_section_decorator
 
 class ProcessCalculator:
     def cal_functions(self, array, func_str: tuple, backend="torch", device="cpu") -> np.ndarray:
@@ -53,39 +52,7 @@ class ProcessCalculatorL2(ProcessCalculator):
         self.n_jobs = config.get("n_jobs", -1)
         torch.set_num_threads(8)
 
-    def fill_inf_with_max_min_section_decorator(self, process_input=True, process_output=True):
-        """Decorator to handle inf values along time and section axes"""
-        def decorator(func):
-            @wraps(func)
-            @torch.no_grad()
-            def wrapper(self, *args, **kwargs):
-                backend = kwargs.get("backend", self.backend)
-                device = kwargs.get("device", self.device)
-                axis = self.config.get("processor_params", {}).get("level2", {}).get("inf_handling", {}).get("axis", 1)
-
-                # Handle input
-                x = args[0]
-                if process_input and isinstance(x, (np.ndarray, torch.Tensor)):
-                    if backend == "torch" and isinstance(x, np.ndarray):
-                        x = torch.from_numpy(x).float().to(device)
-                    x = fill_inf_with_max_min(x, axis=axis, backend=backend, device=device)
-                    if backend == "torch" and isinstance(args[0], np.ndarray):
-                        x = x.cpu().numpy()
-
-                # Execute function
-                result = func(self, x, *args[1:], backend=backend, device=device, **kwargs)
-
-                # Handle output
-                if process_output and isinstance(result, (np.ndarray, torch.Tensor)):
-                    if backend == "torch" and isinstance(result, np.ndarray):
-                        result = torch.from_numpy(result).float().to(device)
-                    result = fill_inf_with_max_min(result, axis=axis, backend=backend, device=device)
-                    if backend == "torch" and isinstance(args[0], np.ndarray):
-                        result = result.cpu().numpy()
-
-                return result
-            return wrapper
-        return decorator
+    
 
     @fill_inf_with_max_min_section_decorator()
     def sum(self, x: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
@@ -207,6 +174,33 @@ class ProcessCalculatorL2(ProcessCalculator):
             result = np.where(mean != 0, std / mean, np.nan)
         return result.transpose()
 
+    
+    @fill_inf_with_max_min_section_decorator()
+    def bop(self, array: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
+        """
+        Calculate Balance of Power (BOP)
+        BOP = (Close - Open) / (High - Low)
+        Args:
+            array (np.ndarray): Input array with shape (n_samples, n_features)
+            backend (str): Backend to use ('numpy' or 'torch')
+            device (str): Device to use for torch backend ('cpu' or 'cuda') 
+        """
+        if backend == "torch":
+            array = torch.from_numpy(array).float().to(device)
+            close = array[-1, :]
+            open_ = array[0, :]
+            high = torch.max(array, dim=0).values
+            low = torch.min(array, dim=0).values
+            result = (close - open_) / (high - low)
+            return result.cpu().numpy()
+        else:
+            close = array[-1, :]
+            open_ = array[0, :]
+            high = np.max(array, axis=0)
+            low = np.min(array, axis=0)
+            result = (close - open_) / (high - low)
+        return result
+    
     @fill_inf_with_max_min_section_decorator()
     def ptp(self, x: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
         """Calculate peak-to-peak across time axis"""
@@ -247,3 +241,4 @@ class ProcessCalculatorL2(ProcessCalculator):
             chunk = x[:, i:i+chunk_size]
             result.append(self.process(chunk))
         return np.hstack(result).transpose()
+    
