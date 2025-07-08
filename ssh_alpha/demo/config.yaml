@@ -1,11 +1,27 @@
 factor_name: "buy_volume_exlarge_order"
-output_dir: "output"
-data_config:
-  buy_volume_exlarge_order:
-    type: "moneyflow"
-    freq: "15"
-params:
-  lookback_period: 100
-  delay_period: 10
-  
-  
+experiment_params:
+  - name: "experiment_1"
+    description: "First experiment"
+    frequency: "5"
+    active: true
+    data_config:
+      buy_volume_exlarge_order:
+        type: "moneyflow"
+        freq: "5"
+    params:
+      lookback_period: 100
+      delay_period: 10
+
+  - name: "experiment_2"
+    description: "Second experiment, different params"
+    frequency: "15"
+    active: true
+    data_config:
+      buy_volume_exlarge_order:
+        type: "moneyflow"
+        freq: "15"
+    params:
+      lookback_period: 200
+      delay_period: 5
+
+  # 可以继续添加更多实验

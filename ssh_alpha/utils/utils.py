@@ -74,12 +74,42 @@ def save_factor(factor: pd.DataFrame, save_path: Path) -> None:
     except Exception as e:
         logger.error(f"save failed: {str(e)}")
         raise
+
+def loop_params(config_path: str, calculate_func: callable):
+    """
+    批量运行 config.yaml 里的所有 experiments，每个 experiment 调用一次 run_factor_pipeline。
+    Args:
+        config_path (str): 配置文件路径
+        calculate_func (callable): 你的因子计算函数
+    """
+    with open(config_path, 'r') as f:
+        config_yaml = yaml.safe_load(f)
+
+    factor_name = config_yaml.get("factor_name", "unknown_factor")
+    experiments = config_yaml.get("experiment_params", [])
+
+    for exp in experiments:
+        if not exp.get("active", True):
+            continue
+        # 合成单个 experiment 的 config
+        exp_config = {
+            "factor_name": factor_name,
+            "frequency": exp.get("frequency"),
+            "data_config": exp.get("data_config"),
+            "params": exp.get("params", {}),
+        }
+        # 你可以根据需要合并更多参数
+
+        logger.info(f"Running experiment: {exp.get('name', '')} ({exp.get('description', '')})")
+        result = run_factor_pipeline(exp_config, calculate_func)
+        logger.info(f"Saved to: {result['save_path']}")
+
 # ---------------------------
-def run_factor_pipeline(config_path: Path, calculate_func: callable) -> Dict[str, Union[pd.DataFrame, dict, str]]:
+def run_factor_pipeline(config: dict, calculate_func: callable) -> Dict[str, Union[pd.DataFrame, dict, str]]:
     """
     main function to run the factor calculation pipeline.
     Args:
-        config_path(Path): Path to the configuration file (YAML format).
+        config: dict: configuration dictionary containing factor name, frequency, data_config, and params.
         calculate_func (callable): function to calculate the factor based on loaded data.
     Returns:
         Dict: includes factor data, configuration, and save path.
@@ -92,9 +122,6 @@ def run_factor_pipeline(config_path: Path, calculate_func: callable) -> Dict[str
     """
     if calculate_func is None:
         raise ValueError("calculate_func must be provided and cannot be None.")
-    # load configuration
-    with open(config.yaml, 'r') as f:
-        config = yaml.safe_load(f)
     
     logger.info(f"starting factor calculation: {config['factor_name']}")
 
@@ -126,7 +153,7 @@ def run_factor_pipeline(config_path: Path, calculate_func: callable) -> Dict[str
             delay = params['delay_period']
             delay_period = int(delay) if isinstance(delay, int) and delay >= 0 else 0
 
-    logger.info(f"lookback_period: {lookback_period}, delay_period: {delay_period}")
+    logger.info(f"freq: {config['frequency']}, lookback_period: {lookback_period}, delay_period: {delay_period}")
    
     factor_params = {
         'lookback_period': lookback_period, 
@@ -139,7 +166,17 @@ def run_factor_pipeline(config_path: Path, calculate_func: callable) -> Dict[str
         factor = pd.DataFrame(index=common_index, columns=common_columns)  # placeholder
 
     # save factor result
-    output_path = Path(config['output_dir']) / f"{config['factor_name']}.parquet"
+    factor_name = config.get('factor_name', 'unknown_factor')
+    frequency = config.get('frequency', 'unknown_freq')
+    if lookback_period > 0 and delay_period > 0:
+        output_name = f"{factor_name}_{frequency}_b{lookback_period}_d{delay_period}.parquet"
+    elif lookback_period > 0:
+        output_name = f"{factor_name}_{frequency}_b{lookback_period}.parquet"
+    elif delay_period > 0:
+        output_name = f"{factor_name}_{frequency}_d{delay_period}.parquet"
+    else:
+        output_name = f"{factor_name}_{frequency}.parquet"
+    output_path = Path(__file__).resolve().parent.parent / f"{config['factor_name']}" / output_name 
     save_factor(factor, output_path)
 
     return {
@@ -149,7 +186,7 @@ def run_factor_pipeline(config_path: Path, calculate_func: callable) -> Dict[str
     }
 
 
-
+# ---------------------------safe calculation of arithmetic operations on multiple DataFrames
 def panel_safe_arithmetic(
     data_dict: dict,
     vars: List[str],

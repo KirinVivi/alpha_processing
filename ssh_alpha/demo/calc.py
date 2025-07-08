@@ -5,7 +5,7 @@ from pathlib import Path
 
 import logging
 from typing import Union, Dict
-from utils.utils import run_factor_pipeline, panel_safe_arithmetic, rolling_avg_at_day, shift_by_days
+from utils.utils import loop_params, panel_safe_arithmetic, rolling_avg_at_day, shift_by_days
 
 # set up logging
 logging.basicConfig(level=logging.INFO)
@@ -74,5 +74,5 @@ if __name__ == "__main__":
     config_path = Path(__file__).parent / "config.yaml"
     logger.info(f"Loading configuration from {config_path}")
     # run the factor calculation pipeline
-    result = run_factor_pipeline(config_path, calculate_factor)
-    print(f"Success:\n{result['factor_data'].head()}")
+    loop_params(config_path, calculate_factor)
+    

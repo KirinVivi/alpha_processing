@@ -1,12 +1,18 @@
+from tkinter import X
+from typing import Tuple
 import numpy as np
+import pandas as pd
 import torch
+import pywt
 import scipy.signal as signal
 from scipy.interpolate import interp1d
-import pywt
-from statsmodels.tsa.filters.hp_filter import hpfilter
-from pykalman import KalmanFilter
-import pandas as pd
+from scipy import fft, sparse
+from scipy.sparse.linalg import spsolve
+from statsmodels.tsa.filters import hpfilter
+# Import pykalman only when needed to avoid ImportError if not installed
 from joblib import Parallel, delayed
+from pykalman import KalmanFilter
+
 
 def _validate_numpy_input(arr):
     """Validate input as 1D or 2D NumPy array"""
@@ -18,12 +24,13 @@ def _validate_numpy_input(arr):
 def _validate_torch_input(arr, device='cpu'):
     """Validate input as 1D or 2D PyTorch tensor"""
     if isinstance(arr, np.ndarray):
-        arr = torch.from_numpy(arr).float()
+        arr = torch.from_numpy(arr).double()
     elif not isinstance(arr, torch.Tensor):
         raise ValueError("Input must be NumPy array or PyTorch tensor")
     if arr.ndim not in (1, 2):
         raise ValueError("Input must be 1D or 2D tensor")
     return arr.to(device)
+
 
 def _to_numpy(arr):
     """Convert to NumPy array"""
@@ -35,66 +42,7 @@ def _handle_all_nan(arr, shape, backend="numpy", device="cpu"):
         return torch.full(shape, float('nan'), device=device)
     return np.full(shape, np.nan)
 
-def _get_wavelet_filters(wavelet="db1"):
-    """
-    Get fixed wavelet filter coefficients
-    Supported wavelets: 'db1' (Haar), 'db4' (Daubechies 4)
-    
-    db1 (Haar):
-        lowpass = [1/√2, 1/√2]
-        highpass = [1/√2, -1/√2]
-    db4 (Daubechies 4):
-        lowpass = [
-            0.4829629131445341, 0.8365163037378079,
-            0.2241438680420134, -0.1294095225512604
-        ]
-        highpass = [
-            -0.1294095225512604, -0.2241438680420134,
-            0.8365163037378079, -0.4829629131445341
-        ]
-    """
-    if wavelet == "db1":
-        lowpass = np.array([1/np.sqrt(2), 1/np.sqrt(2)])
-        highpass = np.array([1/np.sqrt(2), -1/np.sqrt(2)])
-    elif wavelet == "db4":
-        lowpass = np.array([
-            0.4829629131445341, 0.8365163037378079,
-            0.2241438680420134, -0.1294095225512604
-        ])
-        highpass = np.array([
-            -0.1294095225512604, -0.2241438680420134,
-            0.8365163037378079, -0.4829629131445341
-        ])
-    else:
-        raise ValueError("Unsupported wavelet: choose 'db1' or 'db4'")
-    return lowpass, highpass
 
-@torch.no_grad()
-def _dwt_fixed_1d_torch(x, lowpass, highpass, device='cpu'):
-    """Single-column fixed-coefficient DWT (PyTorch)"""
-    x = _validate_torch_input(x, device)
-    if x.ndim == 1:
-        x = x.view(-1, 1)
-    n = x.shape[0]
-    pad_len = len(lowpass) - 1
-    x_padded = torch.nn.functional.pad(x, (pad_len//2, pad_len//2), mode='reflect')
-    x_padded = x_padded.unsqueeze(0).unsqueeze(-1)  # [1, n+pad, 1, 1]
-    lowpass = torch.tensor(lowpass, dtype=torch.float32, device=device).view(1, 1, -1, 1)
-    highpass = torch.tensor(highpass, dtype=torch.float32, device=device).view(1, 1, -1, 1)
-    cA = torch.conv2d(x_padded, lowpass, stride=(2, 1)).squeeze(-1).squeeze(0)  # [n//2, 1]
-    cD = torch.conv2d(x_padded, highpass, stride=(2, 1)).squeeze(-1).squeeze(0)  # [n//2, 1]
-    return cA, cD
-
-def _dwt_fixed_1d_numpy(x, lowpass, highpass):
-    """Single-column fixed-coefficient DWT (NumPy)"""
-    x = _validate_numpy_input(x)
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
-    pad_len = len(lowpass) - 1
-    x_padded = np.pad(x, ((pad_len//2, pad_len//2), (0, 0)), mode='reflect')
-    cA = signal.convolve(x_padded, lowpass[::-1].reshape(-1, 1), mode='valid')[::2]
-    cD = signal.convolve(x_padded, highpass[::-1].reshape(-1, 1), mode='valid')[::2]
-    return cA, cD
 
 def _dwt_ca_1d(x, wavelet, level):
     """Single-column DWT approximation coefficients (pywt)"""
@@ -123,106 +71,284 @@ def _kalman_filter_1d(x, transition_covariance, observation_covariance):
     return smoothed_state_means.flatten()
 
 def _hp_filter_1d(x, lamb):
-    """Single-column HP filter"""
-    x = _validate_numpy_input(x)
-    if np.all(np.isnan(x)):
-        return np.full_like(x, np.nan)
-    cycle, trend = hpfilter(x, lamb=lamb)
-    return trend
+    """Single-column HP filter
+    Optimized Hodrick-Prescott filter for a batch of 1D series (columns).
+    Vectorized using sparse matrix operations.
 
-def _wavelet_denoise_1d(x, wavelet, level, mode):
-    """Single-column wavelet denoising"""
-    x = _validate_numpy_input(x)
-    if np.all(np.isnan(x)):
-        return np.full_like(x, np.nan)
-    coeffs = pywt.wavedec(x, wavelet, level=level)
-    threshold = np.std(coeffs[-1]) * np.sqrt(2 * np.log(len(x)))
-    coeffs = [pywt.threshold(c, threshold, mode=mode) for c in coeffs]
-    return pywt.waverec(coeffs, wavelet)
+    Args:
+        x (np.ndarray): Input data array, shape (num_samples, num_features).
+                                 Assumed to be NaN-free.
+        lamb (float): Smoothing parameter.
+
+    Returns:
+        np.ndarray: Trend component, same shape as x.
+    """
+    num_samples, num_features = x.shape
+
+    # Construct the matrix A = I + lambda * D'D (D is the second difference matrix)
+    # The matrix A has a known sparse, five-diagonal structure.
+    
+    diagonals_A_main = np.zeros(num_samples)
+    diagonals_A_off1 = np.zeros(num_samples - 1)
+    diagonals_A_off2 = np.zeros(num_samples - 2)
+    
+    diagonals_A_main[0] = 1 + lamb
+    diagonals_A_main[1] = 1 + 5 * lamb
+    diagonals_A_main[2:-2] = 1 + 6 * lamb
+    diagonals_A_main[num_samples-2] = 1 + 5 * lamb
+    diagonals_A_main[num_samples-1] = 1 + lamb
+
+    diagonals_A_off1[0] = -2 * lamb
+    diagonals_A_off1[1:-1] = -4 * lamb
+    diagonals_A_off1[num_samples-2] = -2 * lamb
+
+    diagonals_A_off2[:] = lamb
+    
+    # Create sparse matrix in CSC format (efficient for solving)
+    A = sparse.diags(
+        [diagonals_A_main, diagonals_A_off1, diagonals_A_off1, diagonals_A_off2, diagonals_A_off2],
+        [0, 1, -1, 2, -2],
+        shape=(num_samples, num_samples),
+        format='csc'
+    )
+
+    # Solve the system A * trend = x
+    # spsolve can handle a 2D array (batch of right-hand sides) for 'b', performing vectorized solves.
+    trend_batch = spsolve(A, x)
+    
+    return trend_batch
+
 
 @torch.no_grad()
-def dwt_ca_fixed(x, wavelet="db1", backend="torch", device='cpu'):
-    """
-    Fixed-coefficient DWT approximation coefficients
-    This function computes the approximation coefficients of the discrete wavelet transform (DWT)
-    using fixed wavelet filters. It supports both PyTorch and NumPy backends.
+def _fft_core(array: np.ndarray, backend="numpy", device="cpu"):
+    """Single-column Fast Fourier Transform (FFT)"""
+    n_samples, n_features = array.shape
+    
+    # Prepare output array for complex numbers, shape is same as input
+    output_array = np.full((n_samples, n_features), np.nan, dtype=np.complex128)
 
-    Calculation formula:
-        cA[n] = sum_{k=0}^{L-1} x[n + k] * lowpass[L-1-k],  step=2
-    where:
-        - x is the input signal,
-        - lowpass is the wavelet low-pass filter coefficients,
-        - L is the length of the filter,
-        - cA[n] is the approximation coefficient at position n.
-    """
-    if backend == "torch":
-        x = _validate_torch_input(x, device)
-        if torch.all(torch.isnan(x)):
-            return _to_numpy(_handle_all_nan(x, x.shape, backend="torch", device=device))
-        lowpass, highpass = _get_wavelet_filters(wavelet)
-        if x.ndim == 1:
-            cA, _ = _dwt_fixed_1d_torch(x, lowpass, highpass, device=device)
-            return _to_numpy(cA.squeeze(-1))
-        result = []
-        for i in range(x.shape[1]):
-            cA, _ = _dwt_fixed_1d_torch(x[:, i], lowpass, highpass, device=device)
-            result.append(cA.squeeze(-1))
-        return _to_numpy(torch.stack(result, dim=1))
+    if backend == 'torch':
+        if not torch.cuda.is_available() and device == 'cuda':
+            print("Warning: CUDA not available. Falling back to CPU.")
+            device = 'cpu'
+        
+        valid_cols_mask = ~np.isnan(array).any(axis=0)
+        valid_cols_data = array[:, valid_cols_mask]
+        
+        if valid_cols_data.shape[1] > 0:
+            data_tensor = torch.from_numpy(valid_cols_data).double().to(device)
+            # Perform full fft along the samples dimension (dim=0)
+            fft_result_torch = torch.fft.fft(data_tensor, dim=0)
+            output_array[:, valid_cols_mask] = fft_result_torch.cpu().numpy()
+            
+    else: # numpy backend (Optimized)
+        # Identify all columns that are completely free of NaNs
+        valid_cols_mask = ~np.isnan(array).any(axis=0)
+        valid_cols_data = array[:, valid_cols_mask]
+
+        if valid_cols_data.shape[1] > 0:
+            # Perform full fft on all valid columns at once along the samples axis (axis=0)
+            fft_result_np = np.fft.fft(valid_cols_data, axis=0)
+            # Place the results back into the correct columns of the output array
+            output_array[:, valid_cols_mask] = fft_result_np
+                
+    return output_array
+
+def fft_angle_interp1d(x, backend="numpy", device="cpu", amplitude_threshold: float = 1e-10):
+    """Fast Fourier Transform (FFT) with amplitude interpolation"""
+    fft_complex = _fft_core(x, backend, device)
+    # Calculate amplitude to identify low-power frequencies
+    amplitude = np.abs(fft_complex)
+    
+    # Calculate phase
+    phase = np.angle(fft_complex)
+    
+    # Mask the phase where amplitude is too low to be meaningful
+    phase[amplitude < amplitude_threshold] = np.nan
+    
+    return phase
+
+def fft_amp_interp1d(x, backend="numpy", device="cpu"):
+    """Fast Fourier Transform (FFT) with real part interpolation"""
+    fft_complex = _fft_core(x, backend, device)
+    n_samples, n_features = x.shape
+    # Calculate amplitude and normalize by the number of samples
+    amplitude = np.abs(fft_complex) / n_samples
+    
+    # Double the amplitude of all non-DC and non-Nyquist frequencies
+    # to account for the energy in the negative frequencies.
+    # The range is from the first frequency bin (index 1) up to, but not including,
+    # the last bin if N is even (Nyquist frequency).
+    if n_samples % 2 == 0:
+        amplitude[1:-1] *= 2
     else:
-        x = _validate_numpy_input(x)
-        if np.all(np.isnan(x)):
-            return _handle_all_nan(x, x.shape, backend="numpy")
-        lowpass, highpass = _get_wavelet_filters(wavelet)
-        if x.ndim == 1:
-            cA, _ = _dwt_fixed_1d_numpy(x, lowpass, highpass)
-            return cA.flatten()
-        result = []
-        for i in range(x.shape[1]):
-            cA, _ = _dwt_fixed_1d_numpy(x[:, i:i+1], lowpass, highpass)
-            result.append(cA)
-        return np.column_stack(result)
+        amplitude[1:] *= 2        
+    return amplitude
+
+def fft_real_interp1d(x, backend="numpy", device="cpu"):
+    """Fast Fourier Transform (FFT) with real part interpolation"""
+    fft_complex = _fft_core(x, backend, device)
+    n_samples, n_features = x.shape
+    # Extract the real part of the FFT result
+    real_part = np.real(fft_complex)
+    
+    # Normalize by the number of samples
+    real_part /= n_samples
+    
+    # Double the real part of all non-DC and non-Nyquist frequencies
+    if n_samples % 2 == 0:
+        real_part[1:-1] *= 2
+    else:
+        real_part[1:] *= 2
+        
+    return real_part 
 
 @torch.no_grad()
-def dwt_da_fixed(x, wavelet="db1", backend="torch", device='cpu'):
+def dwt_ca_fixed(array, wavelet="db1", backend="torch", device='cpu'):
     """
-    Fixed-coefficient DWT detail coefficients
-    This function computes the detail coefficients of the discrete wavelet transform (DWT)
-    using fixed wavelet filters. It supports both PyTorch and NumPy backends.
-    Calculation formula:    
-        cD[n] = sum_{k=0}^{L-1} x[n + k] * highpass[L-1-k],  step=2
-    where:
-        - x is the input signal,
-        - highpass is the wavelet high-pass filter coefficients,    
-        - L is the length of the filter,
-        - cD[n] is the detail coefficient at position n.
+    Fixed-coefficient DWT approximation coefficients.
+    MODIFIED to output shape (N, M) for (N, M) input, by removing downsampling.
+    """
+    if array.ndim != 2:
+        raise ValueError(f"Input array must be 2D, but got shape {array.shape}")
 
-    """
-    if backend == "torch":
-        x = _validate_torch_input(x, device)
-        if torch.all(torch.isnan(x)):
-            return _to_numpy(_handle_all_nan(x, x.shape, backend="torch", device=device))
-        lowpass, highpass = _get_wavelet_filters(wavelet)
-        if x.ndim == 1:
-            _, cD = _dwt_fixed_1d_torch(x, lowpass, highpass, device=device)
-            return _to_numpy(cD.squeeze(-1))
-        result = []
-        for i in range(x.shape[1]):
-            _, cD = _dwt_fixed_1d_torch(x[:, i], lowpass, highpass, device=device)
-            result.append(cD.squeeze(-1))
-        return _to_numpy(torch.stack(result, dim=1))
+    # 1. Get wavelet decomposition filters using the standard PyWavelets library
+    wavelet_obj = pywt.Wavelet(wavelet)
+    lowpass_filter = wavelet_obj.dec_lo # Low-pass filter for approximation coefficients
+
+    n_samples, n_features = array.shape
+    output_array = np.full_like(array, np.nan, dtype=np.float64)
+    filter_len = len(lowpass_filter)
+
+    if backend == 'torch':
+        # --- PyTorch Backend (Vectorized with Reflect Padding) ---
+        if not torch.cuda.is_available() and device == 'cuda':
+            print("Warning: CUDA not available. Falling back to CPU.")
+            device = 'cpu'
+        
+        valid_cols_mask = ~np.isnan(array).any(axis=0)
+        valid_cols_data = array[:, valid_cols_mask]
+        
+        if valid_cols_data.shape[1] == 0:
+            return output_array
+
+        kernel = torch.tensor(lowpass_filter[::-1].copy(), dtype=torch.float64, device=device)
+        kernel = kernel.view(1, 1, -1)
+        
+        padding = filter_len - 1
+        
+        data_tensor = torch.from_numpy(valid_cols_data.T).to(device).to(torch.float64)
+        data_tensor = data_tensor.unsqueeze(1)
+        
+        data_padded = torch.nn.functional.pad(data_tensor, (padding, 0), mode='reflect')
+        cA_tensor_batch = torch.nn.functional.conv1d(data_padded, kernel)
+        
+        valid_result = cA_tensor_batch.squeeze(1).T.cpu().numpy()
+        output_array[:, valid_cols_mask] = valid_result
+
     else:
-        x = _validate_numpy_input(x)
-        if np.all(np.isnan(x)):
-            return _handle_all_nan(x, x.shape, backend="numpy")
-        lowpass, highpass = _get_wavelet_filters(wavelet)
-        if x.ndim == 1:
-            _, cD = _dwt_fixed_1d_numpy(x, lowpass, highpass)
-            return cD.flatten()
-        result = []
-        for i in range(x.shape[1]):
-            _, cD = _dwt_fixed_1d_numpy(x[:, i:i+1], lowpass, highpass)
-            result.append(cD)
-        return np.column_stack(result)
+        # --- NumPy Backend (with Reflect Padding) ---
+        kernel = np.array(lowpass_filter[::-1], dtype=np.float64)
+        padding = filter_len - 1
+
+        for i in range(n_features):
+            col = array[:, i]
+            
+            if np.isnan(col).any():
+                continue
+            
+            col_padded = np.pad(col, (padding, 0), 'reflect')
+            cA_col = signal.convolve(col_padded, kernel, mode='valid')
+            output_array[:, i] = cA_col
+            
+    return output_array
+
+
+@torch.no_grad()
+def dwt_da_fixed(array, wavelet="db1", backend="torch", device='cpu'):
+    """Fixed-coefficient DWT detail coefficients.
+    MODIFIED to output shape (N, M) for (N, M) input, by removing downsampling.
+    """ 
+    """
+    Calculates the detail coefficients of the Stationary Wavelet Transform (SWT).
+    SWT is also known as undecimated DWT, meaning it avoids downsampling.
+
+    This function operates column-wise, assuming each column is a time series.
+    It is robust to NaN values; if a column contains any NaNs, its output will be all NaNs.
+
+    Args:
+        array (np.ndarray): Input array with shape (n_samples, n_features).
+        wavelet (str): The name of the wavelet to use (e.g., 'db1', 'haar', 'sym4').
+        backend (str): The backend to use, either 'numpy' or 'torch'.
+        device (str): The device to use for the 'torch' backend ('cpu' or 'cuda').
+
+    Returns:
+        np.ndarray: An array of the same shape as the input, containing the
+                    detail coefficients (cD) for each column.
+    """
+    if array.ndim != 2:
+        raise ValueError(f"Input array must be 2D, but got shape {array.shape}")
+
+    # 1. Get wavelet decomposition filters using the standard PyWavelets library
+    wavelet_obj = pywt.Wavelet(wavelet)
+    highpass_filter = wavelet_obj.dec_hi # High-pass filter for detail coefficients
+
+    n_samples, n_features = array.shape
+    output_array = np.full_like(array, np.nan, dtype=np.float64)
+    filter_len = len(highpass_filter)
+
+    if backend == 'torch':
+        # --- PyTorch Backend (Vectorized with Reflect Padding) ---
+        if not torch.cuda.is_available() and device == 'cuda':
+            print("Warning: CUDA not available. Falling back to CPU.")
+            device = 'cpu'
+        
+        valid_cols_mask = ~np.isnan(array).any(axis=0)
+        valid_cols_data = array[:, valid_cols_mask]
+        
+        if valid_cols_data.shape[1] == 0:
+            return output_array
+
+        kernel = torch.tensor(highpass_filter[::-1].copy(), dtype=torch.float64, device=device)
+        kernel = kernel.view(1, 1, -1)
+        
+        # For 'same' convolution, total padding is filter_len - 1
+        padding = filter_len - 1
+        
+        data_tensor = torch.from_numpy(valid_cols_data.T).to(device).to(torch.float64)
+        data_tensor = data_tensor.unsqueeze(1)
+        
+        # Apply 'reflect' padding. PyTorch handles this efficiently.
+        # We add all padding to one side for 'valid' convolution to act like 'same'.
+        data_padded = torch.nn.functional.pad(data_tensor, (padding, 0), mode='reflect')
+        cD_tensor_batch = torch.nn.functional.conv1d(data_padded, kernel)
+        
+        valid_result = cD_tensor_batch.squeeze(1).T.cpu().numpy()
+        output_array[:, valid_cols_mask] = valid_result
+
+    else:
+        # --- NumPy Backend (with Reflect Padding) ---
+        kernel = np.array(highpass_filter[::-1], dtype=np.float64)
+        
+        # For 'same' convolution, total padding is filter_len - 1
+        padding = filter_len - 1
+
+        for i in range(n_features):
+            col = array[:, i]
+            
+            if np.isnan(col).any():
+                continue
+            
+            # Manually apply reflect padding
+            col_padded = np.pad(col, (padding, 0), 'reflect')
+            
+            # Use 'valid' convolution on the padded signal
+            cD_col = signal.convolve(col_padded, kernel, mode='valid')
+            output_array[:, i] = cD_col
+            
+    return output_array
+
+    
 
 def dwt_ca(x, wavelet="db1", level=1, backend="numpy", device="cpu", n_jobs=-1):
     """
@@ -452,29 +578,68 @@ def wavelet_denoise(x, wavelet="db4", level=1, mode="soft", backend="numpy", dev
         - L is the length of the filter,
         - cD[n] is the detail coefficient at position n.
     """
-    if backend == "torch":
-        x = _validate_torch_input(x, device)
-        if torch.all(torch.isnan(x)):
-            return _to_numpy(_handle_all_nan(x, x.shape, backend="torch", device=device))
-        x_np = x.cpu().numpy()
-        if x_np.ndim == 1:
-            return _wavelet_denoise_1d(x_np, wavelet, level, mode)
-        result = Parallel(n_jobs=n_jobs)(
-            delayed(_wavelet_denoise_1d)(x_np[:, i], wavelet, level, mode)
-            for i in range(x_np.shape[1])
-        )
-        return np.column_stack(result)
+    
+    x_tensor = _validate_torch_input(x, device)
+    if torch.all(torch.isnan(x_tensor)):
+        return _to_numpy(_handle_all_nan(x_tensor, x_tensor.shape, backend="torch", device=device))
+    
+    x_np_original = _to_numpy(x_tensor) # Convert to NumPy for pywt and pandas processing
+    num_samples, num_features = x_np_original.shape
+
+    # Store original NaN mask to re-apply later
+    original_nan_mask = np.isnan(x_np_original)
+    
+    x_np_interp = interpolator_arr(x_np_original)
+
+    # Explicitly set columns with less than 2 valid points back to NaN if Pandas didn't
+    valid_counts_per_col = (~original_nan_mask).sum(axis=0)
+    x_np_interp[:, valid_counts_per_col < 2] = np.nan
+
+    # --- DWT/IDWT Processing (fully vectorized using pywt's axes parameter) ---
+    # pywt functions will correctly handle columns that are now all NaNs from interpolation
+    # (they will typically return all-NaN coefficients/reconstructions).
+
+    # Perform multi-level DWT for all columns at once using axes=0
+    coeffs_list = pywt.wavedecn(x_np_interp, wavelet, level=level, axes=0)
+    
+    # Calculate threshold using standard deviation of finest detail coefficients
+    # Flatten the finest detail coefficients across all features for a single threshold
+    all_finest_detail_coeffs = coeffs_list[-1]['d'].flatten()
+    # Handle case where finest detail coeffs are all NaNs (e.g., if input was all NaNs or single point)
+    if np.all(np.isnan(all_finest_detail_coeffs)):
+        threshold = 0.0 # Or some default, or propagate NaNs
     else:
-        x = _validate_numpy_input(x)
-        if np.all(np.isnan(x)):
-            return _handle_all_nan(x, x.shape, backend="numpy")
-        if x.ndim == 1:
-            return _wavelet_denoise_1d(x, wavelet, level, mode)
-        result = Parallel(n_jobs=n_jobs)(
-            delayed(_wavelet_denoise_1d)(x[:, i], wavelet, level, mode)
-            for i in range(x.shape[1])
-        )
-        return np.column_stack(result)
+        threshold = np.nanstd(all_finest_detail_coeffs) * np.sqrt(2 * np.log(num_samples))
+        # Use np.nanstd to ignore NaNs in std calculation if any survived somehow
+
+    # Apply thresholding to detail coefficients
+    denoised_coeffs_list = [coeffs_list[0]] # Approximation coefficients (cA)
+    for i in range(1, len(coeffs_list)): # Iterate through detail coefficient levels (cD1, cD2, ...)
+        detail_coeffs_dict = coeffs_list[i]
+        denoised_level_dict = {}
+        for key, detail_array in detail_coeffs_dict.items():
+            # Apply thresholding to the NumPy array
+            denoised_level_dict[key] = pywt.threshold(detail_array, threshold, mode=mode)
+        denoised_coeffs_list.append(denoised_level_dict) # Append the modified dictionary
+    
+    # Perform Multi-level IDWT to reconstruct the signal (fully vectorized)
+    reconstructed_data_np_raw = pywt.waverecn(denoised_coeffs_list, wavelet, axes=0)
+
+    # Ensure output shape matches original (num_samples, num_features)
+    # pywt.waverecn might sometimes return slightly longer/shorter depending on padding mode.
+    if reconstructed_data_np_raw.shape[0] > num_samples:
+        reconstructed_data_np = reconstructed_data_np_raw[:num_samples, :]
+    elif reconstructed_data_np_raw.shape[0] < num_samples:
+        reconstructed_data_np = np.pad(reconstructed_data_np_raw, 
+                                        ((0, num_samples - reconstructed_data_np_raw.shape[0]), (0, 0)), 
+                                        mode='edge')
+    else:
+        reconstructed_data_np = reconstructed_data_np_raw
+
+    # Re-apply original NaNs to the denoised result (column-wise, vectorized)
+    denoised_final_np = reconstructed_data_np
+    denoised_final_np[original_nan_mask] = np.nan # This is a vectorized operation
+    return denoised_final_np
 
 @torch.no_grad()
 def ewma_filter(x, span=10, backend="torch", device='cpu'):
@@ -518,10 +683,11 @@ def kalman_filter(x, transition_covariance=0.01, observation_covariance=0.1, bac
         return _handle_all_nan(x, x.shape, backend="numpy")
     if x.ndim == 1:
         return _kalman_filter_1d(x, transition_covariance, observation_covariance)
-    result = Parallel(n_jobs=n_jobs)(
-        delayed(_kalman_filter_1d)(x[:, i], transition_covariance, observation_covariance)
+    result = [
+        _kalman_filter_1d(x[:, i], transition_covariance, observation_covariance)
         for i in range(x.shape[1])
-    )
+    ]
+    
     return np.column_stack(result)
 
 def hp_filter(x, lamb=1600, backend="numpy", device="cpu", n_jobs=-1):
@@ -535,16 +701,58 @@ def hp_filter(x, lamb=1600, backend="numpy", device="cpu", n_jobs=-1):
         - x_t is the input signal at time t,
         - L is the smoothing parameter.
     """
-    x = _validate_numpy_input(x)
-    if np.all(np.isnan(x)):
-        return _handle_all_nan(x, x.shape, backend="numpy")
-    if x.ndim == 1:
-        return _hp_filter_1d(x, lamb)
-    result = Parallel(n_jobs=n_jobs)(
-        delayed(_hp_filter_1d)(x[:, i], lamb)
-        for i in range(x.shape[1])
-    )
-    return np.column_stack(result)
+    x_np_original = _validate_numpy_input(x)
+    
+    if np.all(np.isnan(x_np_original)):
+        return _handle_all_nan(x_np_original, x_np_original.shape)
+    
+    if x_np_original.ndim == 1:
+        num_samples = x_np_original.shape[0]
+        nan_mask_1d = np.isnan(x_np_original)
+        
+        if np.any(nan_mask_1d):
+            if np.sum(~nan_mask_1d) < 2:
+                trend_np_1d = np.full_like(x_np_original, np.nan)
+            else:
+                non_nan_indices = np.arange(num_samples)[~nan_mask_1d]
+                non_nan_values = x_np_original[~nan_mask_1d]
+                interp_func = interp1d(non_nan_indices, non_nan_values, 
+                                       kind='linear', bounds_error=False, fill_value='extrapolate')
+                x_np_interp_1d = interp_func(np.arange(num_samples))
+                # Use statsmodels hpfilter for 1D, as it's optimized C code
+                _, trend_np_1d = hpfilter(x_np_interp_1d, lamb=lamb)
+        else:
+            _, trend_np_1d = hpfilter(x_np_original, lamb=lamb)
+        
+        if np.any(nan_mask_1d):
+            trend_np_1d[nan_mask_1d] = np.nan
+        
+        return trend_np_1d
+
+    elif x_np_original.ndim == 2:
+        num_samples, num_features = x_np_original.shape
+
+        original_nan_mask = np.isnan(x_np_original)
+        # --- Vectorized NaN Interpolation using Pandas ---
+        x_np_interp = interpolator_arr(x_np_original)
+
+        # Explicitly set columns with less than 2 valid points back to NaN
+        valid_counts_per_col = (~original_nan_mask).sum(axis=0)
+        x_np_interp[:, valid_counts_per_col < 2] = np.nan
+        
+        # --- Fully Vectorized HP Filter on the batch ---
+        # This calls the _hp_filter_optimized_batch_numpy function
+        trend_np_raw = _hp_filter_1d(x_np_interp, lamb)
+
+        # Re-apply original NaNs to the filtered result
+        trend_final_np = trend_np_raw
+        trend_final_np[original_nan_mask] = np.nan
+
+        return trend_final_np
+
+    else:
+        raise ValueError("Input data must be 1D or 2D.")
+
 
 @torch.no_grad()
 def robust_zscore_filter(x, threshold=3.0, backend="torch", device='cpu'):
@@ -583,54 +791,91 @@ def rolling_rank_filter(x, window=5, backend="numpy", device="cpu"):
         - x[n] is the input signal value at position n,
         - window is the size of the rolling window.
     """
-    x = _validate_numpy_input(x)
-    if np.all(np.isnan(x)):
-        return _handle_all_nan(x, x.shape, backend="numpy")
-    result = np.zeros_like(x)
-    for i in range(x.shape[1]):
-        series = pd.Series(x[:, i])
-        result[:, i] = series.rolling(window=window, min_periods=1).apply(
-            lambda y: pd.Series(y).rank(pct=True).iloc[-1] if not np.all(np.isnan(y)) else np.nan,
-            raw=True
-        )
-    return result
-@torch.no_grad()
+    x_np_original = _validate_numpy_input(x)
+    
+    if np.all(np.isnan(x_np_original)):
+        return _handle_all_nan(x_np_original, x_np_original.shape)
 
-def hilbert_transform_instantaneous_phase(array: np.ndarray, backend="numpy", device="cpu") -> np.ndarray:
-    """
-    Calculate the Hilbert Transform Instantaneous Phase
-    Args:
-        array (np.ndarray): Input array with shape (n_samples, n_features)
-        backend (str): Backend to use ('numpy' or 'torch')
-        device (str): Device to use for torch backend ('cpu' or 'cuda') 
-    """
-    # Use scipy.signal.hilbert for both backends to ensure correct analytic signal calculation
-    if backend == "torch":
-        x = torch.from_numpy(signal).float().to(device)
-        N = x.shape[0]
-
-        # Perform FFT
-        Xf = torch.fft.fft(x)
-
-        # Create Hilbert filter in frequency domain
-        h = torch.zeros(N, dtype=torch.complex64, device=device)
-        h[0] = 1
-        if N % 2 == 0:
-            h[1:N//2] = 2
-            h[N//2] = 1
-        else:
-            h[1:(N+1)//2] = 2
-
-        # Apply filter and get analytic signal
-        analytic_signal = torch.fft.ifft(Xf * h)
-
-        # Get phase
-        instantaneous_phase = torch.unwrap(torch.angle(analytic_signal))
-        return instantaneous_phase.cpu().numpy()
+    # Convert to Pandas DataFrame for efficient rolling operations
+    df = pd.DataFrame(x_np_original)
+    original_ndim = x_np_original.ndim
+    if original_ndim == 1:
+        df = pd.DataFrame(x_np_original.reshape(-1, 1))
     else:
-        analytic_signal = signal.hilbert(array, axis=0)
-        instantaneous_phase = np.unwrap(np.angle(analytic_signal))
-        return instantaneous_phase
+        df = pd.DataFrame(x_np_original)
+
+    # 1. 插值NaN (与之前HP Filter的优化类似)
+    df_interp = df.interpolate(method='linear', axis=0, limit_direction='both', limit_area=None)
+    
+    # 2. 标记少于2个有效点的列 (插值后可能仍为NaN)
+    original_nan_mask = np.isnan(x_np_original) # 重新使用原始的NaN mask
+    valid_counts_per_col = (~original_nan_mask).sum(axis=0)
+    
+    # 3. 计算滚动秩
+    # .rolling().transform('rank', pct=True) 是Pandas中计算滚动秩的向量化、内置方法。
+    # 它会为窗口中的每个元素计算其在当前窗口中的百分比排名。
+    # min_periods=1 确保即使窗口不完整也会计算（对于开头的元素）。
+    # rank method='average' is default.
+    rolling_ranks_df = df_interp.rolling(window=window, min_periods=1).rank(pct=True)
+
+    result_np = rolling_ranks_df.values
+
+    # 4. 重新应用原始的NaN
+    # 对于插值前就是NaN的原始位置，我们去噪/滤波后也应该将其设为NaN。
+    # 另外，对于少于2个有效点的列，结果也应该全部是NaN。
+    
+    # 首先，对于插值前就是NaN的位置，恢复为NaN
+    result_np[original_nan_mask] = np.nan
+
+    # 其次，对于原始就是少于2个有效点的列，确保它们全是NaN
+    if original_ndim == 1: # For 1D input, need to check its single column
+        if valid_counts_per_col.item() < 2: # .item() for 0-dim array
+            result_np[:] = np.nan
+    else: # For 2D input
+        result_np[:, valid_counts_per_col < 2] = np.nan
+
+    # 如果原始输入是1D，则将结果压缩回1D
+    if original_ndim == 1:
+        result_np = result_np.flatten()
+    return result_np
+
+@torch.no_grad()
+def hilbert_transform_instantaneous_phase(
+    array: np.ndarray, 
+    backend: str = "numpy", 
+    device: str = "cpu"
+) -> np.ndarray:
+    """
+    Calculates the Hilbert Transform Instantaneous Phase consistently across backends.
+
+    This function assumes that each row of the input array is a separate signal,
+    and the transform should be applied along axis=1.
+
+    Args:
+        array (np.ndarray): Input array with shape (n_signals, n_samples_per_signal).
+                            For your case, this is (48, 3988).
+        backend (str): Backend to use ('numpy' or 'torch').
+        device (str): Device to use for torch backend ('cpu' or 'cuda').
+
+    Returns:
+        np.ndarray: The unwrapped instantaneous phase of the analytic signal.
+    """
+    # --- Parameter Validation ---
+    if array.ndim != 2:
+        raise ValueError(f"Input array must be 2D, but got shape {array.shape}")
+    # 1. Apply the Hilbert transform along axis=1.
+    # This is the crucial change to make it consistent with the torch backend
+    # and the likely intent for a (signals, samples) shaped array.
+    analytic_signal = signal.hilbert(array, axis=1)
+
+    # 2. Calculate the angle of the complex analytic signal.
+    angle = np.angle(analytic_signal)
+
+    # 3. Unwrap the phase along axis=1 to match the transform axis.
+    instantaneous_phase = np.unwrap(angle, axis=1)
+    
+    return instantaneous_phase
+
 
 @torch.no_grad()
 def kaufman_adaptive_moving_average(x, fast_period=2, slow_period=10, backend="torch", device='cpu'):
@@ -729,6 +974,8 @@ def mesa_adaptive_moving_average(x, fast_period=2, slow_period=10, backend="nump
             return _handle_all_nan(x, x.shape, backend="numpy")
         n = x.shape[0]
         mama = np.zeros_like(x)
+        fama = np.zeros_like(x)
+        fama[0] = x[0]  # FAMA starts the same as M
         mama[0] = x[0]
         fast_alpha = 2 / (fast_period + 1)
         slow_alpha = 2 / (slow_period + 1)
@@ -743,23 +990,162 @@ def mesa_adaptive_moving_average(x, fast_period=2, slow_period=10, backend="nump
                 efficiency_ratio = change / volatility
                 alpha = (efficiency_ratio * (fast_alpha - slow_alpha) + slow_alpha)
             mama[i] = mama[i-1] + alpha * (x[i] - mama[i-1])
-        return mama
+            fama[i] = fama[i-1] + (0.5 * (mama[i] - fama[i-1]))
+        return mama - fama
 
 
-def interpolator_arr(arr):
-    """Interpolate array to handle NaNs"""
-    arr = _validate_numpy_input(arr)
-    if arr.ndim == 1:
-        x = np.arange(len(arr))
-        if np.all(np.isnan(arr)):
-            return np.full_like(arr, np.nan)
-        valid = ~np.isnan(arr)
-        if np.sum(valid) < 2:
-            return np.full_like(arr, np.nan)
-        interpolator = interp1d(x[valid], arr[valid], bounds_error=False, fill_value="extrapolate")
-        return interpolator(x)
-    result = Parallel(n_jobs=-1)(
-        delayed(interpolator_arr)(arr[:, i])
-        for i in range(arr.shape[1])
-    )
-    return np.column_stack(result)
+# def interpolator_arr(arr):
+#     """Interpolate array to handle NaNs"""
+#     arr = _validate_numpy_input(arr)
+#     if arr.ndim == 1:
+#         x = np.arange(len(arr))
+#         if np.all(np.isnan(arr)):
+#             return np.full_like(arr, np.nan)
+#         valid = ~np.isnan(arr)
+#         if np.sum(valid) < 2:
+#             return np.full_like(arr, np.nan)
+#         interpolator = interp1d(x[valid], arr[valid], bounds_error=False, fill_value="extrapolate")
+#         return interpolator(x)
+#     result = Parallel(n_jobs=-1)(
+#         delayed(interpolator_arr)(arr[:, i])
+#         for i in range(arr.shape[1])
+#     )
+#     return np.column_stack(result)
+
+def interpolator_arr(arr_input: tuple[torch.Tensor, np.ndarray], device: str = 'cpu') -> np.ndarray:
+    """
+    Interpolates a PyTorch tensor to handle NaNs along axis 0 (column-wise),
+    using vectorized linear interpolation with extrapolation.
+
+    Args:
+        arr_input (Tuple[torch.Tensor, np.ndarray]): Input tuple containing a PyTorch tensor and a NumPy array,
+                                                      shape (num_samples, num_features).
+        device (str): Device to run computation on ('cpu' or 'cuda').
+
+    Returns:
+        np.ndarray: Interpolated tensor with NaNs filled, same shape as input.
+                    Returns all NaNs if there are less than 2 valid points in a column.
+    """
+    if isinstance(arr_input, np.ndarray):
+        # If input is a NumPy array, convert to PyTorch tensor
+        arr = torch.from_numpy(arr_input).float().to(device)
+    arr = _validate_torch_input(arr, device)
+    original_ndim = arr.ndim
+    # Handle all NaNs in the entire input (early exit)
+    if torch.all(torch.isnan(arr)):
+        return _handle_all_nan(arr.shape, backend="torch", device=device)
+
+    # If 1D, temporarily make it 2D (num_samples, 1) for consistent 2D processing
+    if original_ndim == 1:
+        arr = arr.unsqueeze(1) # Shape (N, 1)
+
+    num_samples, num_features = arr.shape
+
+    # Mask for valid (non-NaN) values
+    valid_mask = ~torch.isnan(arr) # Shape (N, M)
+
+    # Check if less than 2 valid points in *any* column
+    valid_counts_per_col = valid_mask.sum(dim=0) # Shape (M,)
+    cannot_interpolate_cols_mask = (valid_counts_per_col < 2) # Shape (M,)
+
+    # All possible indices along the sample dimension (N,)
+    all_indices_samples = torch.arange(num_samples, dtype=torch.float32, device=device).unsqueeze(1) # Shape (N, 1)
+
+    # --- Find Previous Valid Index ---
+    # `torch.where` with `valid_mask` will correctly place original indices or NaNs.
+    # `cummin` (or `cummax` for next) combined with `ffill`/`bfill` logic is often used.
+    # A more robust approach for finding prev/next valid indices (which also handles extrapolation):
+    
+    # 1. Forward fill indices of valid points, then backward fill them.
+    # This creates a tensor where each element (NaN or not) is associated with the last valid index seen
+    # (for prev_valid_idx) or first valid index (for next_valid_idx).
+    
+    # Values for `scatter_fill` and `roll` to facilitate getting prev/next index
+    valid_indices_broadcast = torch.arange(num_samples, device=device).unsqueeze(1).expand_as(arr)
+    
+    # Create a tensor where valid positions have their indices, and NaNs are ignored
+    # Then use an equivalent of ffill for indices
+    
+    # Previous valid index (each element gets index of last non-nan element on or before it)
+    # This is a common way to simulate ffill for indices:
+    prev_valid_idx = torch.zeros_like(arr, dtype=torch.long, device=device)
+    for i in range(1, num_samples):
+        prev_valid_idx[i] = torch.where(valid_mask[i], i, prev_valid_idx[i-1])
+    # Handle leading NaNs by setting their prev_valid_idx to the index of the first actual valid element in that column
+    first_valid_row_idx = torch.argmax(valid_mask.long(), dim=0) # Index of first True (0 if no True)
+    # If a column has no True, argmax returns 0. Check cannot_interpolate_cols_mask.
+    
+    # Ensure prev_valid_idx points to valid data for leading NaNs
+    # For columns with all NaNs, first_valid_row_idx will be 0, but we'll set them to NaN later.
+    for col_idx in range(num_features):
+        if valid_counts_per_col[col_idx] > 0: # Only if column has at least one valid point
+            first_idx_in_col = first_valid_row_idx[col_idx]
+            prev_valid_idx[0:first_idx_in_col, col_idx] = first_idx_in_col
+        else:
+            prev_valid_idx[:, col_idx] = 0 # Dummy value, will be NaN later
+
+    # Next valid index (each element gets index of first non-nan element on or after it)
+    # Simulate bfill for indices by flipping, ffill, then flipping back
+    next_valid_idx_temp = torch.zeros_like(arr, dtype=torch.long, device=device)
+    flipped_valid_mask = valid_mask.flip(dims=[0])
+    flipped_indices = torch.arange(num_samples, dtype=torch.long, device=device).flip(dims=[0])
+    
+    for i in range(1, num_samples):
+        next_valid_idx_temp[i] = torch.where(flipped_valid_mask[i], flipped_indices[i], next_valid_idx_temp[i-1])
+    next_valid_idx = next_valid_idx_temp.flip(dims=[0])
+
+    # Ensure next_valid_idx points to valid data for trailing NaNs
+    last_valid_row_idx = (num_samples - 1) - torch.argmax(valid_mask.flip(dims=[0]).long(), dim=0) # Index of last True
+    for col_idx in range(num_features):
+        if valid_counts_per_col[col_idx] > 0:
+            last_idx_in_col = last_valid_row_idx[col_idx]
+            next_valid_idx[last_idx_in_col+1:num_samples, col_idx] = last_idx_in_col
+        else:
+            next_valid_idx[:, col_idx] = 0 # Dummy value, will be NaN later
+
+    # --- Get Values at Previous/Next Valid Indices ---
+    # These indices are now guaranteed to be within [0, num_samples-1]
+    prev_val = arr.gather(0, prev_valid_idx) # Shape (N, M)
+    next_val = arr.gather(0, next_valid_idx) # Shape (N, M)
+    
+    # --- Calculate Distances ---
+    dist_prev = all_indices_samples - prev_valid_idx.float() # Shape (N, M)
+    dist_next = next_valid_idx.float() - all_indices_samples # Shape (N, M)
+
+    # --- Calculate Denominator (for interpolation weights) ---
+    denom = dist_prev + dist_next # Shape (N, M)
+    # If denom is 0, it means prev_valid_idx == next_valid_idx (current point is valid, or only 1 valid point).
+    # In this case, `interpolated_val` should just be `prev_val` (or `next_val`).
+    # By setting denom to 1.0, the calculation `(prev_val * 0 + next_val * 0) / 1.0` would yield 0, which is wrong.
+    # The `torch.where(torch.isnan(arr), ..., arr)` handles valid points directly.
+    # So, for interpolation, we only care about `NaN` positions.
+    # For `NaN` positions, `denom` can be 0 only if `prev_valid_idx == next_valid_idx` AND that point is `NaN`.
+    # This implies that a column had only one valid point (which was then used for extrapolation).
+    # If denom is 0 AND it's a NaN point, it means no linear interpolation is possible,
+    # it's pure extrapolation from a single point, so denom needs to be non-zero for division.
+    
+    # More robust denom handling for pure interpolation logic:
+    # If prev_valid_idx == next_valid_idx (means current point is a valid value, or only one valid value in column)
+    # The `torch.where(torch.isnan(arr), ..., arr)` will pick the original valid value.
+    # For NaN points that need interpolation, `denom` cannot be zero unless there are no two distinct valid points.
+    # If `denom` is zero for a NaN point, it means `prev_valid_idx` and `next_valid_idx` point to the same location,
+    # implying only one valid point in the series. Those columns will be handled by `cannot_interpolate_cols_mask`.
+    # So, we can keep denom as is for NaN points.
+    
+    # Set to 1.0 where denom is 0 (for non-nan points; NaNs with denom=0 are handled by mask)
+    denom = torch.where(denom == 0, torch.tensor(1.0, device=device), denom)
+
+    # --- Calculate Interpolated Values ---
+    interpolated_val = (prev_val * dist_next + next_val * dist_prev) / denom
+    
+    # --- Fill Original NaNs with Interpolated Values ---
+    output_arr = torch.where(torch.isnan(arr), interpolated_val, arr)
+
+    # --- Apply Mask for Columns with Less Than 2 Valid Points ---
+    output_arr[:, cannot_interpolate_cols_mask] = torch.nan
+
+    # If original input was 1D, squeeze back to 1D
+    if original_ndim == 1:
+        output_arr = output_arr.squeeze(1) # Shape (N,)
+    
+    return _to_numpy(output_arr)

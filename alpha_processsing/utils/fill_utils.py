@@ -3,14 +3,7 @@ from bz2 import compress
 import pandas as pd
 import numpy as np
 from scipy.stats import pearsonr, spearmanr, kendalltau
-from typing import Dict, List, Tuple, Optional
-import pandas as pd
-import numpy as np
-from sklearn.impute import KNNImputer
-from sklearn.decomposition import PCA
-from typing import Union, Optional, Callable
-from pathlib import Path
-import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Optional, Union, Callable
 
 
 def ffill(data: np.ndarray) -> np.ndarray:
@@ -29,16 +22,13 @@ def bfill(data: np.ndarray) -> np.ndarray:
     data[mask] = data[idx[mask], np.arange(data.shape[1])[None, :][mask]]
     return data
 
-def fill_csm(data: np.ndarray) -> np.ndarray:
+def fill_cross_sectional_mean(data: np.ndarray) -> np.ndarray:
     """Fill missing values with the mean of each row (cross-sectional mean)."""
     data = np.copy(data)
     row_means = np.nanmean(data, axis=1, keepdims=True)
     mask = np.isnan(data)
     data[mask] = row_means[mask]
     return data
-
-def fill_null(data: np.ndarray) -> np.ndarray:
-    return np.copy(data)
 
 def fill_linear_interd(data: np.ndarray) -> np.ndarray:
     """ Fill missing values using linear interpolation. """
@@ -53,7 +43,7 @@ def fill_linear_interd(data: np.ndarray) -> np.ndarray:
             data[mask, col] = np.interp(indices[mask], valid_idx, valid_x)
     return data
 
-def fill_twm(data: np.ndarray, window: int) -> np.ndarray:
+def fill_time_weighted_mean(data: np.ndarray, window: int) -> np.ndarray:
     """Fill missing values using time-weighted mean."""
     data = np.copy(data)
     weights = np.linspace(1, 0.1, window)[::-1]
@@ -74,12 +64,7 @@ def fill_twm(data: np.ndarray, window: int) -> np.ndarray:
     return data
 
 
-def fill_knn(data: np.ndarray, n_neighbors: int = 5) -> np.ndarray:
-    """Fill missing values using KNN imputation."""
-    imputer = KNNImputer(n_neighbors=n_neighbors, weights="distance")
-    return imputer.fit_transform(data)
-
-def fill_movingm(data: np.ndarray, window: int) -> np.ndarray:
+def fill_moving_average(data: np.ndarray, window: int) -> np.ndarray:
     """Fill missing values using moving average."""
     data = np.copy(data)
     for col in range(data.shape[1]):
@@ -91,66 +76,36 @@ def fill_movingm(data: np.ndarray, window: int) -> np.ndarray:
             data[mask, col] = ma[mask]
     return data
 
-def fill_pca(data: np.ndarray, n_components: int = 5) -> np.ndarray:
-    """Fill missing values using a factor model with PCA."""
-    mean = np.nanmean(data, axis=0)
-    std = np.nanstd(data, axis=0)
-    std[std == 0] = 1
-    standardized = (data - mean) / std
-    standardized[np.isnan(standardized)] = 0
-    pca = PCA(n_components=min(n_components, data.shape[1]))
-    factors = pca.fit_transform(standardized)
-    loadings = pca.components_.T
-    reconstructed = np.dot(factors, loadings.T)
-    reconstructed = reconstructed * std + mean
-    mask = np.isnan(data)
-    data = np.copy(data)
-    data[mask] = reconstructed[mask]
-    return data
+
 
 FILL_METHODS: dict[str, Callable] = {
+    "none": lambda data: data,
     "ffill": ffill,
     "bfill": bfill,
-    "fill_cross_sectional_mean": fill_csm,
-    "null": fill_null,
-    "linear_interpolation": fill_linear_interd,
-    "time_weighted_mean": lambda data: fill_twm(data, window=5),
-    "knn_imputation": fill_knn,
-    "moving_average": lambda data: fill_movingm(data, window=5),
-    "factor_model": fill_pca
+    "fill_csm": fill_cross_sectional_mean,
+    "linear_interp": fill_linear_interd,
+    "twm": lambda data: fill_time_weighted_mean(data, window=5),
+    "movingm": lambda data: fill_moving_average(data, window=5),
 }
 
-def fill_data_by_group(
+
+def apply_fillingdata(
     data: pd.DataFrame,
     method: str,
-    window: Optional[int] = None,
-    group_level: str = "group_id"
 ) -> np.ndarray:
     """ Fill missing values in a DataFrame grouped by a specific level of MultiIndex."""
-    if not isinstance(data.index, pd.MultiIndex) or group_level not in data.index.names:
-        raise ValueError(f"data has to be a DataFrame with MultiIndex and group_level must be one of the index names: {data.index.names}")
-
-    if method not in FILL_METHODS:
-        raise ValueError(f"unsupported method: {method}")
-
-    result = data.copy()
-    try:
-        fill_func = FILL_METHODS[method]
-        for group_id in data.index.get_level_values("group_id").unique():
-            group_data = data.xs(group_id, level="group_id")
-            if method in ["time_weighted_mean", "moving_average"] and window is not None:
-                filled = fill_func(group_data.values, window=window)
-            else:
-                filled = fill_func(group_data.values)
-            result.loc[(slice(None), group_id), :] = filled
-    except Exception as e:
-        print(f"filling method {method} failed: {e}")
-    return result.values
+    fill_func = FILL_METHODS.get(method.lower())
+    if fill_func is None:
+        raise ValueError(f"Fill method '{method}' is not supported. Available methods: {list(FILL_METHODS.keys())}")
+    
+    filled_array = fill_func(data)
+    filled_data = pd.DataFrame(filled_array, index=data.index, columns=data.columns)
+    return filled_data
 
 
 
 def analyze_fill_correlation(
-    original_data: pd.DataFrame,
+    group_data:list,
     fill_methods: List[str],
     corr_type: str = "pearson",
     axis: int = 0,
@@ -159,14 +114,16 @@ def analyze_fill_correlation(
     """
     Analyze the correlation of filled data with the original data.
     Args:
-        original_data: 
-            original DataFrame with unique index.
-        fill_methods:
-            List of fill methods to apply
+        group_data: 
+            List of DataFrames or 2D numpy arrays grouped by a specific level of MultiIndex.
+        fill_methods:       
+            List of fill methods to apply. Supported methods are 'ffill', 'bfill', 'fill_cross_sectional_mean',
+            'linear_interpolation', 'time_weighted_mean', and 'moving_average'. 
         corr_type:
-            Type of correlation to compute ('pearson', 'spearman', 'kendall').
+            Type of correlation to compute. Options are 'pearson', 'spearman', or 'kendall'.
         axis:
-            Axis along which to compute correlation (0 for columns, 1 for rows).
+            Axis along which to compute the correlation. 0 for columns, 1 for rows.
+    
     Optional:
         save_dir: 
             Directory to save the correlation results. If None, results are not saved.
@@ -178,10 +135,6 @@ def analyze_fill_correlation(
         ValueError: If corr_type is not one of 'pearson', 'spearman', or 'kendall'.
 
     """
-    if not isinstance(original_data, pd.DataFrame):
-        raise ValueError("oringal_data  has to be a pandas DataFrame")
-    if not original_data.index.is_unique:
-        raise ValueError("original_data with index must have unique index values")
 
     corr_func = {
         "pearson": pearsonr,
@@ -195,28 +148,19 @@ def analyze_fill_correlation(
     filled_data_cache = {}
     for fill_method in fill_methods:
         try:
-            filled_array = fill_data_by_group(original_data, fill_method, window=5)
-            filled_data = pd.DataFrame(filled_array, index=original_data.index, columns=original_data.columns)
-            filled_data_cache[fill_method] = filled_data
-            corr_matrix = filled_data.corrwith(original_data, axis=axis, method=corr_type)
-            valid_corr = corr_matrix[~corr_matrix.isna()]
-
+            filled_array = [apply_fillingdata(data, fill_method) for data in group_data]
+            filled_data_cache[fill_method] = filled_array 
+            # Compute correlation for each row, ignoring NaNs
+            valid_corr = pd.DataFrame(np.vstackfilled_array).corrwith(
+                pd.DataFrame(np.vstack(group_data)),axis=1, method=corr_type) 
             results[fill_method] = {
                 "mean_corr": valid_corr.mean() if not valid_corr.empty else 0.0,
                 "std_corr": valid_corr.std() if not valid_corr.empty else 0.0,
                 "median_corr": valid_corr.median() if not valid_corr.empty else 0.0,
                 "min_corr": valid_corr.min() if not valid_corr.empty else 0.0,
                 "max_corr": valid_corr.max() if not valid_corr.empty else 0.0,
-                "n_valid": len(valid_corr),
-                "mean_diff": np.nanmean(np.abs(filled_array - original_data.values)),
-                "std_diff": np.nanstd(filled_array - original_data.values)
+                "n_valid": len(valid_corr)
             }
-            
-            if save_dir:
-                save_path = Path(save_dir)
-                save_path.mkdir(parents=True, exist_ok=True)
-                filepath = save_path / f"filled_{fill_method}.parquet"
-                filled_data.to_parquet(filepath, compression='zstd', index=True, engine='pyarrow')
         except Exception as e:
             print(f"filling_method {fill_method} calculation failed: {e}")
             results[fill_method] = {
@@ -234,7 +178,7 @@ def analyze_fill_correlation(
 
 def select_robust_fill_methods(
     corr_results: Dict[str, Dict[str, float]],
-    corr_threshold: float = 0.9,
+    corr_threshold: float = 0.7,
     std_threshold: float = 0.1,
     min_valid_ratio: float = 0.8,
     max_methods: int = 3) -> List[str]:

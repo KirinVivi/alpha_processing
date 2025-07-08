@@ -23,20 +23,43 @@ def clean_empty_nodes(d: dict) -> dict:
         ) if v not in (None, {}, "")
     }
 
-def cal_ic(ret: pd.DataFrame, alpha: pd.DataFrame, window=20):
+def cal_ic(ret: pd.DataFrame, alpha: pd.DataFrame, threshold: float = 0.018):
     """
     Calculate the Information Coefficient (IC) between alpha and ret.
+
     Args:
         ret (pd.DataFrame): Returns data with dates as index and assets as columns.
         alpha (pd.DataFrame): Alpha factor data with dates as index and assets as columns.
-        window (int): Rolling window size for calculating IC.
+        threshold (float): Threshold for determining if IC is significant. Default is 0.015.
+
     Returns:
-        tuple: A tuple containing a boolean indicating if the absolute IC is greater than 0.015, and the IC series.
+        tuple: A tuple containing a boolean indicating if the absolute IC is greater than threshold, and the IC value.
+
+    Raises:
+        ValueError: If DataFrames have no common columns or indices.
     """
-    alpha = alpha[alpha.index.isin(ret.index)]
-    ret = ret[ret.index.isin(alpha.index)]
-    ic = alpha.rolling(window=window).corr(ret).mean()
-    return np.abs(ic) > 0.015, ic
+    # Find common columns and indices more efficiently
+    common_cols = ret.columns.intersection(alpha.columns)
+    common_index = ret.index.intersection(alpha.index)
+
+    # Validate that we have common data
+    if common_cols.empty:
+        raise ValueError("No common columns found between ret and alpha DataFrames")
+    if common_index.empty:
+        raise ValueError("No common indices found between ret and alpha DataFrames")
+
+    # Align data using pandas built-in methods (more efficient than manual sorting)
+    ret_aligned = ret.loc[common_index, common_cols]
+    alpha_aligned = alpha.loc[common_index, common_cols]
+
+    # Calculate IC using vectorized operations
+    ic = alpha_aligned.corrwith(ret_aligned, axis=1).mean()
+    rank_ic = alpha_aligned.rank(axis=1).corrwith(ret_aligned.rank(axis=1), axis=1).mean()
+    # Handle NaN case
+    if pd.isna(ic):
+        return False, 0.0
+
+    return (np.abs(ic) > threshold) and (np.abs(rank_ic) > threshold), ic, rank_ic
 
 @ray.remote
 def compute_corr_batch(ret: pd.DataFrame, batch: dict) -> dict:
@@ -56,7 +79,7 @@ def compute_corr_batch(ret: pd.DataFrame, batch: dict) -> dict:
             for smooth_func, df in subgroups.items():
                 ic_result = cal_ic(ret, df)
                 if ic_result[0]:
-                    res_d[fill_func][cal_func][smooth_func] = df
+                    res_d[fill_func][cal_func][smooth_func] = df, ic_result[1]
     return res_d
 
 
@@ -65,8 +88,9 @@ def save_nested_dict(data: Dict, save_dir: str, filename: Optional[str] = None) 
     Save a nested dictionary to files in a specified directory using pathlib.Path.
     Args:
         data (Dict): The nested dictionary to save.
+        {'cal_func': {'smooth_func': df}}
         save_dir (str): The directory where the files will be saved.
-        filename (Optional[str]): The base filename for the saved files. If None, defaults to "result".
+        filename (Optional[str]): The base filename for the saved files. If None, defaults to "result". # fill_func
     Returns:
         List[str]: A list of file paths where the data was saved.
     Raises: 
@@ -82,9 +106,9 @@ def save_nested_dict(data: Dict, save_dir: str, filename: Optional[str] = None) 
         for key, value in data.items():
             if isinstance(value, dict):
                 for subkey, subvalue in value.items():
-                    if isinstance(subvalue, (pd.DataFrame, np.ndarray)):
+                   if isinstance(subvalue, (pd.DataFrame, np.ndarray)):
                         df = pd.DataFrame(subvalue) if isinstance(subvalue, np.ndarray) else subvalue
-                        filepath = save_dir / f"{filename}_{key}_{subkey}.parquet"
+                        filepath = save_dir / f"{filename}__{key}__{subkey}.parquet"
                         df.to_parquet(filepath, engine="pyarrow", index=True, compression='zstd')
                         file_paths.append(str(filepath))
             elif isinstance(value, (pd.DataFrame, np.ndarray)):
@@ -105,19 +129,24 @@ def load_nested_dict(save_dir: str, batch_size: int):
     for i in range(0, len(all_files), batch_size):
         batch = {}
         for file_path in all_files[i:i + batch_size]:
-            keys = os.path.basename(file_path).replace(".parquet", "").split("_")
-            fill_func, cal_func, smooth_func = keys[0], "_".join(keys[1:-1]), keys[-1]
+            keys = os.path.basename(file_path).replace(".parquet", "").split("__")
+            fill_func, cal_func, smooth_func = keys[0], "__".join(keys[1:-1]), keys[-1]
             batch.setdefault(fill_func, {}).setdefault(cal_func, {})[smooth_func] = pd.read_parquet(file_path, engine="pyarrow")
         yield batch
-
-def extract_values_from_string(s: str):
-    if isinstance(s, str) and "[" in s:
-        match = re.match(r"(\w+)\[([\d\s,]+)\]", s)
-        if match:
-            func_name, params = match.groups()
-            params = eval(f"[{params}]")
-            return func_name, params
+    
+def extract_value_from_string(input_string: str):
+    """
+    Extract values from a string in the format 'func(a,b)' or 'funcN'.
+    Returns a tuple of extracted values, or None if no match is found.
+    """
+    match = re.match(r'(\w+)\((\d+),(\d+)\)', input_string)
+    if match:
+        return match.group(1), int(match.group(2)), int(match.group(3))
+    match = re.match(r'(\w+)(\d+)', input_string)
+    if match:
+        return match.group(1), int(match.group(2))
     return None
+
 
 
 def group_and_merge_data(
@@ -154,23 +183,4 @@ def group_and_merge_data(
         raise ValueError("No valid data found after grouping. Check your window size or data content.")
     
     return pd.concat(merged_dfs).sort_index()
-
-def select_robust_fill_methods(
-    corr_results: Dict[str, Dict[str, float]],
-    corr_threshold: float = 0.9,
-    std_threshold: float = 0.1,
-    min_valid_ratio: float = 0.8,
-    max_methods: int = 3
-) -> List[str]:
-    """筛选鲁棒填充方法"""
-    robust_methods = []
-    total_cols = max([stats["n_valid"] for stats in corr_results.values()])
-    
-    for method, stats in corr_results.items():
-        if (stats["mean_corr"] >= corr_threshold and
-            stats["std_corr"] <= std_threshold and
-            stats["n_valid"] / total_cols >= min_valid_ratio):
-            robust_methods.append(method)
-    
-    return robust_methods[:max_methods] if robust_methods else list(corr_results.keys())[:max_methods]
 

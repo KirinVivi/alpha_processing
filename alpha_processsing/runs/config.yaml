@@ -32,164 +32,289 @@ global_settings:
   # other settings
   default_batch_size: 20  # 批处理大小，用于 load_nested_dict 和 compute_ic
 
-# 处理器参数
-processor_params:
-  level1:
-    shrink_factor: 1.0  # 用于标准化数据，防止数值溢出
-    inf_handling:
-      axis: 0  # 处理无穷大值的轴（0 为时间轴，1 为横截面轴）
-    filters:  # 过滤器参数配置
-      dwt_ca_fixed:
-        wavelet: db1  # 离散小波变换使用的 wavelet 类型
-      dwt_da_fixed:
-        wavelet: db1
-      dwt_ca:
-        wavelet: db1
-        level: 1
-      dwt_da:
-        wavelet: db1
-        level: 1
-      savgol_filter:
-        window_length: 5
-        polyorder: 2
-      median_filter:
-        size: 5
-      lowpass_filter:
-        cutoff: 0.1
-        fs: 10.0
-        order: 5
-      highpass_filter:
-        cutoff: 0.1
-        fs: 10.0
-        order: 5
-      butter_highpass_filter:
-        cutoff: 0.1
-        fs: 10.0
-        order: 5
-      bandpass_filter:
-        lowcut: 0.1
-        highcut: 0.5
-        fs: 10.0
-        order: 5
-      wavelet_denoise:
-        wavelet: db4
-        level: 1
-        mode: soft
-      ewma_filter:
-        span: 10
-      kalman_filter:
-        transition_covariance: 0.01
-        observation_covariance: 0.1
-      hp_filter:
-        lamb: 1600
-      robust_zscore_filter:
-        threshold: 3.0
-      rolling_rank_filter:
-        window: 5
-      adaptive_moving_average:
-        window: 10
-        sensitivity: 2.0
 
+# functions settings
+function_settings:
+  # level1_functions: 一级函数列表
+  # level2_functions: 二级函数列表
+  # processorfilter_params: 过滤器参数配置
+  # filter_params: 滤波器参数配置
+  level1_functions:
+    section_funcs:
+      - diff # numpy/torch 0.002
+      - apo # numpy/torch 0.003
+      - abs_v # numpy/torch 0.001
+      - sigmoid # numpy/torch 0.003
+      - exp # numpy 0.001
+      - tan # numpy 0.001
+      - sin # numpy 0.009
+      - cos # numpy 0.007
+      - asin # numpy 0.001
+      - acos # numpy 0.003
+      - atan # numpy 0.001
+      - lg1p # numpy 0.002
+      - sinh # numpy/torch 0.002
+      - cosh # numpy/torch 0.002
+      - tanh # numpy/torch 0.002
+      - reciprocal # numpy 0.002
+      - sec_zsc # numpy 0.003
+      - pct_rank # numpy 0.02
+      - bin # numpy 0.004
+      - binshannon # Todo: 
+      - trewgt # numpy 0.002
+      - revwgt # numpy 0.008
+      - trerevwgt # numpy 0.006
+    ts_funcs:
+      filt_funcs:
+        - fft_amp # numpy/ torch 0.004
+        - fft_angle # numpy 0.009
+        - fft_r # numpy/ torch 0.007
+        - dwt_ca_fver # torch 0.06
+        - dwt_da_fver # torch 0.06
+        - savgolfilt # torch 0.005
+        - medfilt # numpy 0.06
+        - lowpfilt # torch 0.005
+        - highpfilt # torch 0.006
+        - bandpfilt # torch 0.009
+        - wdfilt # torch / numpy 0.11
+        - hpfilt # torch / numpy 0.09
+        - rob_zsfilt # torch 0.003
+        - rollrankfilt # pandas 0.28
+        - ewma # torch 0.003
+        - kalfilt # numpy 26
+        - hb_insphase # numpy 0.03
+        - kauama # numpy 0.015
+        - mesama # numpy 0.011
+      expand_funcs:
+        - expandmean # torch 0.003
+        - expandmax # numpy 0.001
+        - expandmin  # numpy 0.003
+        - expandzscore # torch 0.003
+        - expandstd # numpy 0.003
+        - expandskew # pandas 0.06
+        - expandkurt # pandas 0.06
+        - expandsum # numpy 0.002
+      roll_funcs:
+        - aroonosc # torch 0.006
+        - rollmean # torch 0.003
+        - rollmax # torch 0.009
+        - rollmin # torch 0.002
+        - rollzscore # torch 0.007
+        - rollstd # torch 0.003
+        - rollskew # torch 0.03
+        - rollkurt # torch 0.03
+        - rollsum # torch 0.004
+          
   level2:
-    inf_handling:
-      axis: 1  # 处理无穷大值的轴（0 为时间轴，1 为横截面轴）
+    - quantile_25
+    - mean
+    - quantile_75
+    - skew
+    - kurt
+    - cv
+    - ptp
+    - sum
+    - stddev
+    - bop
 
-# 过滤参数
-filter_params:
-  level1:
-    windows: [2, 5, 7]  # 窗口大小列表，用于 group_data_by_window 和 process_level1
-    fill_methods: [null, fill_cross_sectional_mean, ffill]  # 数据填充方法
-  level2:
-    smoothing_methods: [quantile_25, mean, quantile_75, skew, kurt, cv, ptp, sum, stddev]  # 平滑方法列表
+  # filter functions_params
+  filter_params:
+    level1:
+      shrink_factor: 1.0  # 用于标准化数据，防止数值溢出
+      inf_handling:
+        axis: 0  # 处理无穷大值的轴（0 为时间轴，1 为横截面轴）
+      filters:  # 过滤器参数配置
+        dwt_ca_fixed:
+          wavelet: db1  # 离散小波变换使用的 wavelet 类型
+        dwt_da_fixed:
+          wavelet: db1
+        dwt_ca:
+          wavelet: db1
+          level: 1
+        dwt_da:
+          wavelet: db1
+          level: 1
+        savgol_filter:
+          window_length: 5
+          polyorder: 2
+        median_filter:
+          size: 5
+        lowpass_filter:
+          cutoff: 0.1
+          fs: 1
+          order: 5
+        highpass_filter:
+          cutoff: 0.1
+          fs: 1
+          order: 5
+        butter_highpass_filter:
+          cutoff: 0.1
+          fs: 1
+          order: 5
+        bandpass_filter:
+          lowcut: 0.1
+          highcut: 0.5
+          fs: 1
+          order: 5
+        wavelet_denoise:
+          wavelet: db4
+          level: 1
+          mode: soft
+        ewma_filter:
+          span: 10
+        kalman_filter:
+          transition_covariance: 0.01
+          observation_covariance: 0.1
+        hp_filter:
+          lamb: 1600
+        robust_zscore_filter:
+          threshold: 3.0
+        rolling_rank_filter:
+          window: 5
+        kaufman_adaptive_moving_average:
+          fast_period: 2
+          slow_period: 10
+        mesa_adaptive_moving_average:
+          fast_period: 2
+          slow_period: 10
+        # heikin_ashi_insphase:
+          # period: 14  # Heikin-Ashi 指标的周期
+
+# # 过滤参数
+# filter_params:
+#   level1:
+#     windows: [2, 5, 7]  # 窗口大小列表，用于 group_data_by_window 和 process_level1
+#     fill_methods: [null, fill_cross_sectional_mean, ffill]  # 数据填充方法
+#   level2:
+#     smoothing_methods: [quantile_25, mean, quantile_75, skew, kurt, cv, ptp, sum, stddev]  # 平滑方法列表
 
 experiments:
-  - name: "experiment_1"
-    description: "First experiment with basic settings"
+  - id: "exp1" # represents the factor name
     active: true
-
-    data_params:
-      table_name: "moneyflow_data"
-      table_type: "moneyflow"
-      table_freq: "15"
-    func_params:
-      level1:
-        rolling_para: [2, 5, 7]  # 窗口大小列表
-        func_list:
-          - diff
-          - apo
-          - abs_v
-          - sigmoid
-          - tan
-          - sin
-          - cos
-          - sinh
-          - cosh
-          - tanh  
-          - reciprocal
-          - pct_rank
-          - dwt_ca
-          - dwt_da
-          - dwt_ca_fver
-          - dwt_da_fver
-          - savgolfilt
-          - medfilt
-          - lowpfilt
-          - highpfilt
-          - bandpfilt
-          - wdfilt
-          - hpfilt
-          - rob_zsfilt
-          - rollrankfilt
-          - ewma
-          - kalfilt
-          - hb_insphase
-          - kauama
-          - mesama
-          - meanwgt
-          - expwgt
-          - revwgt
-
-          - aroonosc
-          - rolling_mean
-          - rolling_max
-          - rolling_min
-          - rolling_zscore
-          - rolling_std
-          - rolling_skew
-          - rolling_kurt
-      level2:
-        func_list:
-          - quantile_25
-          - mean
-          - quantile_75
-          - skew
-          - kurt
-          - cv
-          - ptp
-          - sum
-          - stddev
-          - bop
-
-      
-
-  - name: "experiment_2"
-    description: "Second experiment with modified parameters"
+    data_params: # suffix for data parameters
+      - 5
+      - 15
+      - 30_b10_d1
+      - 60_b20_d1
+    
+  - id: "exp2"
     active: true
     data_params:
-      table_name: "moneyflow_data"
-      table_type: "moneyflow"
-      table_freq: "30"
-    func_params:
-      func_name: "process_moneyflow_data"
-      func_type: "moneyflow"
+      - 5
+      - 15
+      - 30_b10_d1
+      - 60_b20_d1
+    
+  
 
-  - name: "experiment_3"
-    description: "Third experiment with further modifications"
-    active: true
-    data_params:
-      table_name: "moneyflow_data"
-      table_type: "moneyflow"
-      table_freq: "60"
-    func_params:
-      func_name: "process_moneyflow_data"
-      func_type: "moneyflow"
+
+
+# experiments:
+#   - id: "experiment_1"
+#     description: "First experiment with basic settings"
+#     data_params:
+#       table_name: "moneyflow_data"
+#       table_type: "moneyflow"
+#       table_freq: "15"
+#     func_params:
+#       level1:
+#       rolling_para: [2, 5, 7]  # 窗口大小列表
+#       func_list:
+#         - diff # numpy/torch 0.002
+#         - apo # numpy/torch 0.003
+#         - abs_v # numpy/torch 0.001
+#         - sigmoid # numpy/torch 0.003
+#         - exp # numpy 0.001
+#         - tan # numpy 0.001
+#         - sin # numpy 0.009
+#         - cos # numpy 0.007
+#         - asin # numpy 0.001
+#         - acos # numpy 0.003
+#         - atan # numpy 0.001
+#         - lg1p # numpy 0.002
+#         - sinh # numpy/torch 0.002
+#         - cosh # numpy/torch 0.002
+#         - tanh # numpy/torch 0.002
+#         - reciprocal # numpy 0.002
+#         - sec_zsc # numpy 0.003
+#         - pct_rank # numpy 0.02
+#         - bin # numpy 0.004
+#         - binshannon # Todo: 
+#         - trewgt # numpy 0.002
+#         - revwgt # numpy 0.008
+#         - trerevwgt # numpy 0.006
+
+#         - fft_amp # numpy/ torch 0.004
+#         - fft_angle # numpy 0.009
+#         - fft_r # numpy/ torch 0.007
+#         - dwt_ca_fver # torch 0.06
+#         - dwt_da_fver # torch 0.06
+#         - savgolfilt # torch 0.005
+#         - medfilt # numpy 0.06
+#         - lowpfilt # torch 0.005
+#         - highpfilt # torch 0.006
+#         - bandpfilt # torch 0.009
+#         - wdfilt # torch / numpy 0.11
+#         - hpfilt # torch / numpy 0.09
+#         - rob_zsfilt # torch 0.003
+#         - rollrankfilt # pandas 0.28
+#         - ewma # torch 0.003
+#         - kalfilt # numpy 26
+#         - hb_insphase # numpy 0.03
+#         - kauama # numpy 0.015
+#         - mesama # numpy 0.011
+        
+#         - expandmean # torch 0.003
+#         - expandmax # numpy 0.001
+#         - expandmin  # numpy 0.003
+#         - expandzscore # torch 0.003
+#         - expandstd # numpy 0.003
+#         - expandskew # pandas 0.06
+#         - expandkurt # pandas 0.06
+#         - expandsum # numpy 0.002
+
+#         - aroonosc # torch 0.006
+#         - rollmean # torch 0.003
+#         - rollmax # torch 0.009
+#         - rollmin # torch 0.002
+#         - rollzscore # torch 0.007
+#         - rollstd # torch 0.003
+#         - rollskew # torch 0.03
+#         - rollkurt # torch 0.03
+#         - rollsum # torch 0.004
+        
+#       level2:
+#       func_list:
+#         - quantile_25
+#         - mean
+#         - quantile_75
+#         - skew
+#         - kurt
+#         - cv
+#         - ptp
+#         - sum
+#         - stddev
+#         - bop
+#     active: true
+
+#     - name: "experiment_2"
+#     description: "Second experiment with modified parameters"
+#     data_params:
+#       table_name: "moneyflow_data"
+#       table_type: "moneyflow"
+#       table_freq: "30"
+#     func_params:
+#       func_name: "process_moneyflow_data"
+#       func_type: "moneyflow"
+#     active: true
+
+#     - name: "experiment_3"
+#     description: "Third experiment with further modifications"
+#     data_params:
+#       table_name: "moneyflow_data"
+#       table_type: "moneyflow"
+#       table_freq: "60"
+#     func_params:
+#       func_name: "process_moneyflow_data"
+#       func_type: "moneyflow"
+#     active: true
