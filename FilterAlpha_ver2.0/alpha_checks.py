@@ -26,6 +26,7 @@ Methods:
         Checks if the drawdown is less than or equal to the configured threshold.
     check_win(self, win: float) -> bool
         Checks if the win rate meets or exceeds the configured threshold.
+    check 
 """
 
 import logging

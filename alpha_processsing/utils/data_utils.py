@@ -1,12 +1,30 @@
 import os
 import re
 import ray
+import torch
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from scipy.interpolate import interp1d
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
+import logging
 
+# Optional: Configure logging for clear feedback
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+def _traverse_and_save(node: Any, key_path: List[str], save_dir_path: Path, base_filename: str, saved_files: List[str]):
+    if isinstance(node, (pd.DataFrame, np.ndarray)):
+        df_to_save = pd.DataFrame(node) if isinstance(node, np.ndarray) else node
+        full_key_str = "__".join(key_path)
+        output_filename = f"{base_filename}__{full_key_str}.parquet"
+        filepath = save_dir_path / output_filename
+        df_to_save.to_parquet(filepath, engine="pyarrow", index=True, compression='zstd')
+        saved_files.append(str(filepath))
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            _traverse_and_save(value, key_path + [key])
 
 def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """filter out rows and columns that are all NaN or all zeros"""
@@ -83,6 +101,7 @@ def compute_corr_batch(ret: pd.DataFrame, batch: dict) -> dict:
     return res_d
 
 
+
 def save_nested_dict(data: Dict, save_dir: str, filename: Optional[str] = None) -> List[str]:
     """
     Save a nested dictionary to files in a specified directory using pathlib.Path.
@@ -96,29 +115,31 @@ def save_nested_dict(data: Dict, save_dir: str, filename: Optional[str] = None) 
     Raises: 
         RuntimeError: If an error occurs during saving.
     """
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    file_paths = []
-
-    if filename is None:
-        filename = "result"
+    save_dir_path = Path(save_dir)
+    save_dir_path.mkdir(parents=True, exist_ok=True)
+    saved_files: List[str] = []
+    base_filename = filename if filename is not None else "result"
     try:
-        for key, value in data.items():
-            if isinstance(value, dict):
-                for subkey, subvalue in value.items():
-                   if isinstance(subvalue, (pd.DataFrame, np.ndarray)):
-                        df = pd.DataFrame(subvalue) if isinstance(subvalue, np.ndarray) else subvalue
-                        filepath = save_dir / f"{filename}__{key}__{subkey}.parquet"
-                        df.to_parquet(filepath, engine="pyarrow", index=True, compression='zstd')
-                        file_paths.append(str(filepath))
-            elif isinstance(value, (pd.DataFrame, np.ndarray)):
-                df = pd.DataFrame(value) if isinstance(value, np.ndarray) else value
-                filepath = save_dir / f"{filename}_{key}.parquet"
-                df.to_parquet(filepath, engine="pyarrow", index=True)
-                file_paths.append(str(filepath))
+        _traverse_and_save(data, [], save_dir_path, base_filename, saved_files)
     except Exception as e:
-        raise RuntimeError(f"error happened in saving datas: {e}")
-    return file_paths
+        raise RuntimeError(f"An error occurred while saving data: {e}") from e
+    return saved_files
+
+def delete_drop_mid_data(save_dir: str, drop_list: list):
+    dir_path = Path(save_dir)
+
+    # The function won't crash if the directory doesn't exist.
+    if not dir_path.is_dir():
+        logging.warning(f"Directory '{dir_path}' not found. Nothing to delete.")
+        return
+    for filename in drop_list:
+        file_path = dir_path / f"{filename}.parquet"
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError as e:
+            # This catches other errors, like permission issues, without crashing.
+            logging.error(f"Failed to delete {file_path}: {e}")
+
 
 def load_nested_dict(save_dir: str, batch_size: int):
     all_files = []
@@ -142,7 +163,7 @@ def extract_value_from_string(input_string: str):
     match = re.match(r'(\w+)\((\d+),(\d+)\)', input_string)
     if match:
         return match.group(1), int(match.group(2)), int(match.group(3))
-    match = re.match(r'(\w+)(\d+)', input_string)
+    match = re.match(r'(\w+)_(\d+)', input_string)
     if match:
         return match.group(1), int(match.group(2))
     return None
@@ -184,3 +205,146 @@ def group_and_merge_data(
     
     return pd.concat(merged_dfs).sort_index()
 
+
+def restructure_results(flat_dict: Dict[Tuple[Any, str], pd.DataFrame]) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    將扁平的結果字典重組為嵌套字典。
+    
+    輸入範例 (flat_dict):
+    {
+        (('ts_rank_60',), 'smooth_A'): pd.DataFrame(...),
+        (('ts_rank_60',), 'smooth_B'): pd.DataFrame(...),
+        (('filt_top_30',), 'smooth_A'): pd.DataFrame(...)
+    }
+
+    輸出範例 (nested_dict):
+    {
+        'ts_rank_60': {
+            'smooth_A': pd.DataFrame(...),
+            'smooth_B': pd.DataFrame(...)
+        },
+        'filt_top_30': {
+            'smooth_A': pd.DataFrame(...)
+        }
+    }
+    """
+    # defaultdict(dict) 讓我們在訪問一個新 key 時，會自動為它創建一個空字典
+    nested_dict = defaultdict(dict)
+    
+    for full_key, df in flat_dict.items():
+        l1_tuple, l2_func = full_key
+        
+        # 為了讓 key 更美觀，我們將 L1 的元組 key 轉換為用 '__' 連接的字串
+        # 例如 ('ts_rank_60', 'filt_top_30') -> 'ts_rank_60__filt_top_30'
+        # 如果只有一個元素，如 ('ts_rank_60',)，則變為 'ts_rank_60'
+        cal_func_key = "__".join(l1_tuple)
+        
+        # 將 smooth_func 作為內層字典的 key
+        smooth_func_key = l2_func
+        
+        # 構建嵌套結構
+        nested_dict[cal_func_key][smooth_func_key] = df
+        
+    # 將 defaultdict 轉換回普通的 dict，以便輸出
+    return dict(nested_dict)
+
+def interpolator_arr(arr_input: tuple[torch.Tensor, np.ndarray], device: str = 'cpu') -> np.ndarray:
+    """
+    Interpolates a PyTorch tensor to handle NaNs along axis 0 (column-wise),
+    using vectorized linear interpolation with extrapolation.
+
+    Args:
+        arr_input (Tuple[torch.Tensor, np.ndarray]): Input tuple containing a PyTorch tensor and a NumPy array,
+                                                      shape (num_samples, num_features).
+        device (str): Device to run computation on ('cpu' or 'cuda').
+
+    Returns:
+        np.ndarray: Interpolated tensor with NaNs filled, same shape as input.
+                    Returns all NaNs if there are less than 2 valid points in a column.
+    """
+    if isinstance(arr_input, np.ndarray):
+        # If input is a NumPy array, convert to PyTorch tensor
+        arr = torch.from_numpy(arr_input).float().to(device)
+    original_ndim = arr.ndim
+    # Handle all NaNs in the entire input (early exit)
+    if torch.all(torch.isnan(arr)):
+        return torch.full(arr.shape, float('nan'), device=device)
+
+    # If 1D, temporarily make it 2D (num_samples, 1) for consistent 2D processing
+    if original_ndim == 1:
+        arr = arr.unsqueeze(1) # Shape (N, 1)
+
+    num_samples, num_features = arr.shape
+
+    # Mask for valid (non-NaN) values
+    valid_mask = ~torch.isnan(arr) # Shape (N, M)
+
+    # Check if less than 2 valid points in *any* column
+    valid_counts_per_col = valid_mask.sum(dim=0) # Shape (M,)
+    cannot_interpolate_cols_mask = (valid_counts_per_col < 2) # Shape (M,)
+
+    # All possible indices along the sample dimension (N,)
+    all_indices_samples = torch.arange(num_samples, dtype=torch.float32, device=device).unsqueeze(1) # Shape (N, 1)
+    prev_valid_idx = torch.zeros_like(arr, dtype=torch.long, device=device)
+    for i in range(1, num_samples):
+        prev_valid_idx[i] = torch.where(valid_mask[i], i, prev_valid_idx[i-1])
+    # Handle leading NaNs by setting their prev_valid_idx to the index of the first actual valid element in that column
+    first_valid_row_idx = torch.argmax(valid_mask.long(), dim=0) # Index of first True (0 if no True)
+    # If a column has no True, argmax returns 0. Check cannot_interpolate_cols_mask.
+    
+    # Ensure prev_valid_idx points to valid data for leading NaNs
+    # For columns with all NaNs, first_valid_row_idx will be 0, but we'll set them to NaN later.
+    for col_idx in range(num_features):
+        if valid_counts_per_col[col_idx] > 0: # Only if column has at least one valid point
+            first_idx_in_col = first_valid_row_idx[col_idx]
+            prev_valid_idx[0:first_idx_in_col, col_idx] = first_idx_in_col
+        else:
+            prev_valid_idx[:, col_idx] = 0 # Dummy value, will be NaN later
+
+    # Next valid index (each element gets index of first non-nan element on or after it)
+    # Simulate bfill for indices by flipping, ffill, then flipping back
+    next_valid_idx_temp = torch.zeros_like(arr, dtype=torch.long, device=device)
+    flipped_valid_mask = valid_mask.flip(dims=[0])
+    flipped_indices = torch.arange(num_samples, dtype=torch.long, device=device).flip(dims=[0])
+    
+    for i in range(1, num_samples):
+        next_valid_idx_temp[i] = torch.where(flipped_valid_mask[i], flipped_indices[i], next_valid_idx_temp[i-1])
+    next_valid_idx = next_valid_idx_temp.flip(dims=[0])
+
+    # Ensure next_valid_idx points to valid data for trailing NaNs
+    last_valid_row_idx = (num_samples - 1) - torch.argmax(valid_mask.flip(dims=[0]).long(), dim=0) # Index of last True
+    for col_idx in range(num_features):
+        if valid_counts_per_col[col_idx] > 0:
+            last_idx_in_col = last_valid_row_idx[col_idx]
+            next_valid_idx[last_idx_in_col+1:num_samples, col_idx] = last_idx_in_col
+        else:
+            next_valid_idx[:, col_idx] = 0 # Dummy value, will be NaN later
+
+    # --- Get Values at Previous/Next Valid Indices ---
+    # These indices are now guaranteed to be within [0, num_samples-1]
+    prev_val = arr.gather(0, prev_valid_idx) # Shape (N, M)
+    next_val = arr.gather(0, next_valid_idx) # Shape (N, M)
+    
+    # --- Calculate Distances ---
+    dist_prev = all_indices_samples - prev_valid_idx.float() # Shape (N, M)
+    dist_next = next_valid_idx.float() - all_indices_samples # Shape (N, M)
+
+    # --- Calculate Denominator (for interpolation weights) ---
+    denom = dist_prev + dist_next # Shape (N, M) 
+    # Set to 1.0 where denom is 0 (for non-nan points; NaNs with denom=0 are handled by mask)
+    denom = torch.where(denom == 0, torch.tensor(1.0, device=device), denom)
+
+    # --- Calculate Interpolated Values ---
+    interpolated_val = (prev_val * dist_next + next_val * dist_prev) / denom
+    
+    # --- Fill Original NaNs with Interpolated Values ---
+    output_arr = torch.where(torch.isnan(arr), interpolated_val, arr)
+
+    # --- Apply Mask for Columns with Less Than 2 Valid Points ---
+    output_arr[:, cannot_interpolate_cols_mask] = torch.nan
+
+    # If original input was 1D, squeeze back to 1D
+    if original_ndim == 1:
+        output_arr = output_arr.squeeze(1) # Shape (N,)
+    
+    return output_arr.cpu().numpy()

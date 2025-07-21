@@ -8,8 +8,8 @@ Functions:
     validate_config(config: Dict[str, Union[str, float, int]]) -> FilterAlphaConfig:
         Validates a configuration dictionary and returns a FilterAlphaConfig instance.
 """
-from pydantic import BaseModel, Field, field_validator
-import yaml
+from pydantic import BaseModel, Field, field_validator # type: ignore
+import yaml # type: ignore
 from typing import Dict, Union
 
 class FilterAlphaConfig(BaseModel):

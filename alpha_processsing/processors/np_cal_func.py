@@ -55,10 +55,9 @@ def fill_inf_with_max_min_section_decorator(process_input=True, process_output=T
         @wraps(func)
         @torch.no_grad()
         def wrapper(self, *args, **kwargs):
-            backend = kwargs.get("backend", self.backend)
-            device = kwargs.get("device", self.device)
+            backend = kwargs.get("backend", "numpy")
+            device = kwargs.get("device", "cpu")
             axis = self.config.get("processor_params", {}).get("level2", {}).get("inf_handling", {}).get("axis", 1)
-
            
             x = args[0]
             is_df = isinstance(x, pd.DataFrame)
@@ -99,8 +98,8 @@ def fill_inf_with_max_min_ts_decorator(process_input=True, process_output=True):
         @wraps(func)
         @torch.no_grad()
         def wrapper(self, *args, **kwargs):
-            backend = kwargs.get("backend", self.backend)
-            device = kwargs.get("device", self.device)
+            backend = kwargs.get("backend", "numpy")
+            device = kwargs.get("device", "cpu")
             axis = self.config.get("processor_params", {}).get("level1", {}).get("inf_handling", {}).get("axis", 0)
             arr = args[0]
 

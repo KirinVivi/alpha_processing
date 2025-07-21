@@ -588,7 +588,8 @@ class ProcessCalculatorL1(ProcessCalculator):
         if backend == "torch":
             x = torch.from_numpy(array).double().to(device)
             result = torch.cumsum(x, dim=0) / torch.arange(1, x.shape[0] + 1, device=device).unsqueeze(1)
-            result[nan_mask] = float('nan')  # 恢复 NaN
+            nan_mask_tensor = torch.from_numpy(nan_mask).to(device)
+            result[nan_mask_tensor] = float('nan')  # 恢复 NaN  # 恢复 NaN
             return result.cpu().numpy()
         else:
             res = np.cumsum(array, axis=0) / np.arange(1, array.shape[0] + 1)[:, None]

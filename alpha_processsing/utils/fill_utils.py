@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import pearsonr, spearmanr, kendalltau
 from typing import Dict, List, Tuple, Optional, Union, Callable
+from sklearn.impute import KNNImputer
 
 
 def ffill(data: np.ndarray) -> np.ndarray:
@@ -11,7 +12,9 @@ def ffill(data: np.ndarray) -> np.ndarray:
     mask = np.isnan(data)
     idx = np.where(~mask, np.arange(data.shape[0])[:, None], 0)
     np.maximum.accumulate(idx, axis=0, out=idx)
-    data[mask] = data[idx[mask], np.arange(data.shape[1])[None, :][mask]]
+    row_indices = idx[mask]  # Shape: (num_nans,)
+    col_indices = np.where(mask)[1]  # Shape: (num_nans,)
+    data[mask] = data[row_indices, col_indices]
     return data
 
 def bfill(data: np.ndarray) -> np.ndarray:
@@ -19,7 +22,9 @@ def bfill(data: np.ndarray) -> np.ndarray:
     mask = np.isnan(data)
     idx = np.where(~mask, np.arange(data.shape[0])[:, None], data.shape[0] - 1)
     np.minimum.accumulate(idx[::-1], axis=0, out=idx[::-1])
-    data[mask] = data[idx[mask], np.arange(data.shape[1])[None, :][mask]]
+    row_indices = idx[mask]          # Shape: (num_nans,)
+    col_indices = np.where(mask)[1]  # Shape: (num_nans,)
+    data[mask] = data[row_indices, col_indices]
     return data
 
 def fill_cross_sectional_mean(data: np.ndarray) -> np.ndarray:
@@ -27,7 +32,7 @@ def fill_cross_sectional_mean(data: np.ndarray) -> np.ndarray:
     data = np.copy(data)
     row_means = np.nanmean(data, axis=1, keepdims=True)
     mask = np.isnan(data)
-    data[mask] = row_means[mask]
+    data[mask] = np.broadcast_to(row_means, data.shape)[mask]
     return data
 
 def fill_linear_interd(data: np.ndarray) -> np.ndarray:
@@ -43,49 +48,54 @@ def fill_linear_interd(data: np.ndarray) -> np.ndarray:
             data[mask, col] = np.interp(indices[mask], valid_idx, valid_x)
     return data
 
-def fill_time_weighted_mean(data: np.ndarray, window: int) -> np.ndarray:
+def fill_time_weighted_mean(data: np.ndarray) -> np.ndarray:
     """Fill missing values using time-weighted mean."""
-    data = np.copy(data)
-    weights = np.linspace(1, 0.1, window)[::-1]
-    weights /= weights.sum()
-    
-    for col in range(data.shape[1]):
-        x = data[:, col]
-        mask = np.isnan(x)
-        for i in np.where(mask)[0]:
-            past_idx = np.where(~np.isnan(x[:i+1]))[0]
-            future_idx = np.where(~np.isnan(x[i:]))[0] + i
-            past = x[past_idx[-window:]] if len(past_idx) > 0 else np.array([])
-            future = x[future_idx[:window]] if len(future_idx) > 0 else np.array([])
-            values = np.concatenate([past, future])
-            if len(values) > 0:
-                w = weights[:len(values)]
-                data[i, col] = np.average(values, weights=w)
+    col_means = np.nanmean(data, axis=0)
+    nan_indices = np.isnan(data)
+    filled_data = np.where(nan_indices, col_means, data)
     return data
 
+def fill_knn_imputation(data: np.ndarray, k: int = 5) -> np.ndarray:
+    """
+    使用 K-近邻 (K-Nearest Neighbors) 算法填充缺失值。
 
-def fill_moving_average(data: np.ndarray, window: int) -> np.ndarray:
-    """Fill missing values using moving average."""
-    data = np.copy(data)
-    for col in range(data.shape[1]):
-        x = data[:, col]
-        mask = np.isnan(x)
-        if mask.any():
-            df = pd.Series(x)
-            ma = df.rolling(window=window, min_periods=1, center=True).mean().values
-            data[mask, col] = ma[mask]
-    return data
+    该方法通过寻找每个缺失点的 K 个最近邻样本，并用这些邻居的
+    特征均值来填充缺失值。
+
+    Args:
+        data (np.ndarray): 输入的 NumPy 数组，包含 NaN 值。
+        k (int): 用于填充的邻居数量。
+
+    Returns:
+        np.ndarray: 填充了缺失值的新数组。
+    """
+    if np.isnan(data).sum() == 0:
+        return data.copy()
+    is_all_nan_col = np.all(np.isnan(data), axis=0)
+    all_nan_col_indices = np.where(is_all_nan_col)[0]
+    good_col_indices = np.where(~is_all_nan_col)[0]
+  
+    if good_col_indices.size == 0:
+        return data.copy()
+    data_to_impute = data[:, good_col_indices]
+    imputer = KNNImputer(n_neighbors=k, weights='uniform')
+    filled_good_data = imputer.fit_transform(data_to_impute)
+    final_data = np.full_like(data, fill_value=np.nan)
+    final_data[:, good_col_indices] = filled_good_data  
+    return final_data
 
 
+        
 
 FILL_METHODS: dict[str, Callable] = {
     "none": lambda data: data,
     "ffill": ffill,
     "bfill": bfill,
-    "fill_csm": fill_cross_sectional_mean,
-    "linear_interp": fill_linear_interd,
-    "twm": lambda data: fill_time_weighted_mean(data, window=5),
-    "movingm": lambda data: fill_moving_average(data, window=5),
+    "fill_cross_sectional_mean": fill_cross_sectional_mean,
+    "fill_linear_interp": fill_linear_interd,
+    "fill_time_weighted_mean": fill_time_weighted_mean,
+    "fill_knn_imputation": lambda data: fill_knn_imputation(data, k=5)
+
 }
 
 
@@ -98,7 +108,7 @@ def apply_fillingdata(
     if fill_func is None:
         raise ValueError(f"Fill method '{method}' is not supported. Available methods: {list(FILL_METHODS.keys())}")
     
-    filled_array = fill_func(data)
+    filled_array = fill_func(data.copy())
     filled_data = pd.DataFrame(filled_array, index=data.index, columns=data.columns)
     return filled_data
 
@@ -111,7 +121,7 @@ def analyze_fill_correlation(
     axis: int = 0,
     save_dir: Optional[str] = None
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, np.ndarray]]:
-    """
+    """ 
     Analyze the correlation of filled data with the original data.
     Args:
         group_data: 
@@ -143,16 +153,15 @@ def analyze_fill_correlation(
     }.get(corr_type.lower())
     if corr_func is None:
         raise ValueError(f" upper corr_type: {corr_type} is not supported, select pearson, spearman or kendall")
-
+    origin_df = pd.DataFrame(np.vstack(group_data))
     results = {}
     filled_data_cache = {}
     for fill_method in fill_methods:
         try:
             filled_array = [apply_fillingdata(data, fill_method) for data in group_data]
-            filled_data_cache[fill_method] = filled_array 
+            filled_data_cache[fill_method] = filled_array.copy()
             # Compute correlation for each row, ignoring NaNs
-            valid_corr = pd.DataFrame(np.vstackfilled_array).corrwith(
-                pd.DataFrame(np.vstack(group_data)),axis=1, method=corr_type) 
+            valid_corr = pd.DataFrame(np.vstack(filled_array)).corrwith(origin_df,axis=1, method=corr_type) 
             results[fill_method] = {
                 "mean_corr": valid_corr.mean() if not valid_corr.empty else 0.0,
                 "std_corr": valid_corr.std() if not valid_corr.empty else 0.0,
@@ -178,7 +187,7 @@ def analyze_fill_correlation(
 
 def select_robust_fill_methods(
     corr_results: Dict[str, Dict[str, float]],
-    corr_threshold: float = 0.7,
+    corr_threshold: float = 0.95,
     std_threshold: float = 0.1,
     min_valid_ratio: float = 0.8,
     max_methods: int = 3) -> List[str]:
@@ -208,15 +217,18 @@ def select_robust_fill_methods(
     robust_methods = []
     for method, stats in corr_results.items():
         if (
-            stats["mean_corr"] >= corr_threshold and
+            stats["mean_corr"] <= corr_threshold and
             stats["std_corr"] <= std_threshold and
             stats["n_valid"] / total_cols >= min_valid_ratio
         ):
             robust_methods.append((method, stats["mean_corr"], stats["std_corr"], stats["mean_diff"]))
-
+    if len(robust_methods) == 0:
+        return ["none"]
     # sort methods by mean correlation, then by std deviation, then by mean difference
     robust_methods.sort(key=lambda x: (-x[1], x[2], x[3]))
 
     # keep only the method names up to max_methods
     return [method for method, _, _, _ in robust_methods[:max_methods]]
+
+
 
